@@ -180,6 +180,15 @@ Skripte — beide Wege schließen sich nicht aus, sollten aber nicht gemischt
 werden: der projekteigene `install_cron.sh` schreibt in die User-crontab,
 `vps_setup.sh` nach `/etc/cron.d`.
 
+Wenn der Screener bereits woanders läuft (eigener Clone, eigenes venv, eigene
+Cron/systemd-Einrichtung) und nur der Scout über dieses Skript verwaltet werden
+soll, blendet `--no-screener` ihn komplett aus — kein zweiter Clone, keine
+Cron-Datei, kein Listener-Dienst für ihn. Spiegelbildlich gibt es `--no-scout`.
+
+```bash
+sudo bash deploy/vps_setup.sh --no-screener --all
+```
+
 Danach den API-Key eintragen — je nach `llm.provider` `GEMINI_API_KEY` oder
 `GROQ_API_KEY`:
 

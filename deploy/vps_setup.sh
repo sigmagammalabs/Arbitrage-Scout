@@ -66,6 +66,8 @@ WITH_LISTENER=0
 WITH_LOGROTATE=1
 INSTALL_SYSTEM_PACKAGES=1
 DRY_RUN=0
+SETUP_SCOUT=1
+SETUP_SCREENER=1
 
 # ---------------------------------------------------------------------------
 # Ausgabe
@@ -156,6 +158,9 @@ Optionen:
   --python PFAD          Python-Interpreter   (Standard: python3)
   --scout-repo URL       Arbitrage-Scout per git clone holen
   --screener-repo URL    Screener per git clone holen
+  --no-scout             Arbitrage-Scout ueberspringen
+  --no-screener          Screener ueberspringen (z. B. wenn er bereits
+                          anderswo laeuft und eigene deploy/*.sh nutzt)
   --with-cron            Cron-Eintraege unter /etc/cron.d anlegen
   --with-listener        Telegram-Listener des Screeners als systemd-Dienst
   --all                  Wie --with-cron --with-listener
@@ -176,6 +181,8 @@ while [[ $# -gt 0 ]]; do
         --python)        PYTHON_BIN=${2:?Pfad fehlt}; shift 2 ;;
         --scout-repo)    SCOUT_REPO=${2:?URL fehlt}; shift 2 ;;
         --screener-repo) SCREENER_REPO=${2:?URL fehlt}; shift 2 ;;
+        --no-scout)      SETUP_SCOUT=0; shift ;;
+        --no-screener)   SETUP_SCREENER=0; shift ;;
         --with-cron)     WITH_CRON=1; shift ;;
         --with-listener) WITH_LISTENER=1; shift ;;
         --all)           WITH_CRON=1; WITH_LISTENER=1; shift ;;
@@ -430,7 +437,8 @@ install_cron() {
     log "Cron-Eintraege unter /etc/cron.d"
 
     # Ein PATH ist noetig: cron startet mit einer sehr sparsamen Umgebung.
-    write_file /etc/cron.d/arbitrage-scout 644 <<CRONSCOUT
+    if (( SETUP_SCOUT )); then
+        write_file /etc/cron.d/arbitrage-scout 644 <<CRONSCOUT
 # Arbitrage Selling Scout -- von vps_setup.sh erzeugt
 SHELL=/bin/bash
 PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
@@ -438,8 +446,12 @@ MAILTO=""
 CRON_TZ=$SCOUT_CRON_TZ
 $(cron_line "$SCOUT_CRON_TIME" "$BASE_DIR/$SCOUT_NAME" "$SCOUT_CRON_CMD" "$SCOUT_LOG")
 CRONSCOUT
+    else
+        skip "Cron-Datei fuer Arbitrage Scout uebersprungen (--no-scout)"
+    fi
 
-    write_file /etc/cron.d/premarket-screener 644 <<CRONSCREENER
+    if (( SETUP_SCREENER )); then
+        write_file /etc/cron.d/premarket-screener 644 <<CRONSCREENER
 # Pre-Market Screener -- von vps_setup.sh erzeugt
 # Aufgerufen wird der Wrapper des Projekts (deploy/run_scan.sh), nicht direkt
 # main.py: der Wrapper setzt Universe, Export, Telegram-Versand und KI-Briefing.
@@ -450,6 +462,9 @@ MAILTO=""
 CRON_TZ=$SCREENER_CRON_TZ
 $(cron_line "$SCREENER_CRON_TIME" "$BASE_DIR/$SCREENER_NAME" "$SCREENER_CRON_CMD" "$SCREENER_LOG")
 CRONSCREENER
+    else
+        skip "Cron-Datei fuer Pre-Market Screener uebersprungen (--no-screener)"
+    fi
 
     ok "Cron-Dateien geschrieben"
 }
@@ -459,6 +474,10 @@ CRONSCREENER
 # systemd: Telegram-Listener des Screeners
 # ---------------------------------------------------------------------------
 install_listener_service() {
+    if (( ! SETUP_SCREENER )); then
+        skip "Telegram-Listener uebersprungen (--no-screener)"
+        return
+    fi
     if (( ! WITH_LISTENER )); then
         skip "Telegram-Listener uebersprungen (--with-listener aktiviert ihn)"
         return
@@ -546,8 +565,10 @@ verify() {
     log "Pruefung"
     (( DRY_RUN )) && { skip "im Dry-Run nichts zu pruefen"; return; }
 
-    local name dir py
-    for name in "$SCOUT_NAME" "$SCREENER_NAME"; do
+    local name dir py checked=()
+    (( SETUP_SCOUT ))    && checked+=("$SCOUT_NAME")
+    (( SETUP_SCREENER )) && checked+=("$SCREENER_NAME")
+    for name in "${checked[@]}"; do
         dir="$BASE_DIR/$name"
         py="$dir/.venv/bin/python"
         if [[ -x "$py" ]]; then
@@ -559,7 +580,7 @@ verify() {
 
     # Der Scout bringt eine eigene Konfigurationspruefung mit.
     local scout_dir="$BASE_DIR/$SCOUT_NAME"
-    if [[ -f "$scout_dir/scout.py" && -x "$scout_dir/.venv/bin/python" ]]; then
+    if (( SETUP_SCOUT )) && [[ -f "$scout_dir/scout.py" && -x "$scout_dir/.venv/bin/python" ]]; then
         log "scout.py --check-config"
         local runner=(env -C "$scout_dir" "$scout_dir/.venv/bin/python" scout.py --check-config)
         (( IS_ROOT )) && runner=(sudo -u "$SERVICE_USER" "${runner[@]}")
@@ -576,9 +597,13 @@ summary() {
     printf '  Einrichtung abgeschlossen%s\n' "$( (( DRY_RUN )) && printf ' (DRY-RUN, nichts veraendert)')"
     printf '%s============================================================%s\n\n' "$C_INFO" "$C_RESET"
 
+    local services=""
+    (( SETUP_SCOUT ))    && services="$SCOUT_NAME"
+    (( SETUP_SCREENER )) && services="${services:+$services, }$SCREENER_NAME"
+
     printf '  Basis:     %s\n' "$BASE_DIR"
     printf '  Benutzer:  %s\n' "$SERVICE_USER"
-    printf '  Dienste:   %s, %s\n\n' "$SCOUT_NAME" "$SCREENER_NAME"
+    printf '  Dienste:   %s\n\n' "${services:-keine (--no-scout und --no-screener gesetzt)}"
 
     if (( ${#WARNINGS[@]} )); then
         printf '  %sOffene Punkte:%s\n' "$C_WARN" "$C_RESET"
@@ -587,51 +612,52 @@ summary() {
         printf '\n'
     fi
 
-    cat <<NEXT
-  Naechste Schritte:
+    printf '  Naechste Schritte:\n\n'
+    printf '    1. Secrets eintragen\n'
+    if (( SETUP_SCOUT )); then
+        printf '         sudoedit %s/%s/.env\n' "$BASE_DIR" "$SCOUT_NAME"
+        printf '           GEMINI_API_KEY oder GROQ_API_KEY, je nach llm.provider\n'
+    fi
+    if (( SETUP_SCREENER )); then
+        printf '         sudoedit %s/%s/.env\n' "$BASE_DIR" "$SCREENER_NAME"
+        printf '           TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, GROQ_API_KEY\n'
+    fi
 
-    1. Secrets eintragen
-         sudoedit $BASE_DIR/$SCOUT_NAME/.env
-           GEMINI_API_KEY oder GROQ_API_KEY, je nach llm.provider
-         sudoedit $BASE_DIR/$SCREENER_NAME/.env
-           TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, GROQ_API_KEY
+    printf '\n    2. Testlauf ohne Nebenwirkungen\n'
+    if (( SETUP_SCOUT )); then
+        printf '         sudo -u %s env -C %s/%s .venv/bin/python scout.py --dry-run\n' \
+            "$SERVICE_USER" "$BASE_DIR" "$SCOUT_NAME"
+    fi
+    if (( SETUP_SCREENER )); then
+        printf '         sudo -u %s env -C %s/%s .venv/bin/python main.py scan \\\n' \
+            "$SERVICE_USER" "$BASE_DIR" "$SCREENER_NAME"
+        printf '              --universe custom --tickers SAP.DE,SIE.DE --min-gap-pct 0.1\n'
+    fi
 
-    2. Testlauf, beide ohne Nebenwirkungen
-         sudo -u $SERVICE_USER env -C $BASE_DIR/$SCOUT_NAME \\
-              .venv/bin/python scout.py --dry-run
-         sudo -u $SERVICE_USER env -C $BASE_DIR/$SCREENER_NAME \\
-              .venv/bin/python main.py scan --universe custom \\
-              --tickers SAP.DE,SIE.DE --min-gap-pct 0.1
-
-  Betrieb:
-
-    Logs Scout     tail -f $BASE_DIR/$SCOUT_NAME/logs/*.log
-    Logs Screener  tail -f $BASE_DIR/$SCREENER_NAME/watchlist/*.log
-    Listener       systemctl status $SCREENER_SERVICE_NAME
-                   journalctl -u $SCREENER_SERVICE_NAME -f
-    Cron-Status    systemctl status cron
-    Update         cd $BASE_DIR/<dienst> && sudo -u $SERVICE_USER git pull
-                   dann dieses Skript erneut ausfuehren
-                   (Listener danach: systemctl restart $SCREENER_SERVICE_NAME)
-NEXT
+    printf '\n  Betrieb:\n\n'
+    (( SETUP_SCOUT ))    && printf '    Logs Scout     tail -f %s/%s/logs/*.log\n' "$BASE_DIR" "$SCOUT_NAME"
+    (( SETUP_SCREENER )) && printf '    Logs Screener  tail -f %s/%s/watchlist/*.log\n' "$BASE_DIR" "$SCREENER_NAME"
+    (( SETUP_SCREENER && WITH_LISTENER )) && printf '    Listener       systemctl status %s\n                   journalctl -u %s -f\n' \
+        "$SCREENER_SERVICE_NAME" "$SCREENER_SERVICE_NAME"
+    (( WITH_CRON )) && printf '    Cron-Status    systemctl status cron\n'
+    printf '    Update         cd %s/<dienst> && sudo -u %s git pull\n' "$BASE_DIR" "$SERVICE_USER"
+    printf '                   dann dieses Skript erneut ausfuehren\n'
+    (( SETUP_SCREENER && WITH_LISTENER )) && printf '                   (Listener danach: systemctl restart %s)\n' "$SCREENER_SERVICE_NAME"
 
     if (( WITH_CRON && ! IS_ROOT )); then
-        cat <<CRONHINT
-
-  Cron braucht root. Diese Zeilen als root in /etc/cron.d ablegen:
-
-    # /etc/cron.d/arbitrage-scout
-    CRON_TZ=$SCOUT_CRON_TZ
-    $(cron_line "$SCOUT_CRON_TIME" "$BASE_DIR/$SCOUT_NAME" "$SCOUT_CRON_CMD" "$SCOUT_LOG")
-
-    # /etc/cron.d/premarket-screener
-    CRON_TZ=$SCREENER_CRON_TZ
-    $(cron_line "$SCREENER_CRON_TIME" "$BASE_DIR/$SCREENER_NAME" "$SCREENER_CRON_CMD" "$SCREENER_LOG")
-CRONHINT
+        printf '\n  Cron braucht root. Diese Zeilen als root in /etc/cron.d ablegen:\n\n'
+        if (( SETUP_SCOUT )); then
+            printf '    # /etc/cron.d/arbitrage-scout\n    CRON_TZ=%s\n    %s\n\n' \
+                "$SCOUT_CRON_TZ" "$(cron_line "$SCOUT_CRON_TIME" "$BASE_DIR/$SCOUT_NAME" "$SCOUT_CRON_CMD" "$SCOUT_LOG")"
+        fi
+        if (( SETUP_SCREENER )); then
+            printf '    # /etc/cron.d/premarket-screener\n    CRON_TZ=%s\n    %s\n' \
+                "$SCREENER_CRON_TZ" "$(cron_line "$SCREENER_CRON_TIME" "$BASE_DIR/$SCREENER_NAME" "$SCREENER_CRON_CMD" "$SCREENER_LOG")"
+        fi
     elif (( WITH_CRON )); then
-        printf '\n  Cron aktiv:\n    %-22s %s %s\n    %-22s %s %s\n' \
-            "$SCOUT_NAME" "$SCOUT_CRON_TIME" "($SCOUT_CRON_TZ)" \
-            "$SCREENER_NAME" "$SCREENER_CRON_TIME" "($SCREENER_CRON_TZ)"
+        printf '\n  Cron aktiv:\n'
+        (( SETUP_SCOUT ))    && printf '    %-22s %s (%s)\n' "$SCOUT_NAME" "$SCOUT_CRON_TIME" "$SCOUT_CRON_TZ"
+        (( SETUP_SCREENER )) && printf '    %-22s %s (%s)\n' "$SCREENER_NAME" "$SCREENER_CRON_TIME" "$SCREENER_CRON_TZ"
     fi
     printf '\n'
 }
@@ -649,8 +675,17 @@ main() {
     run mkdir -p "$BASE_DIR"
     (( IS_ROOT )) && run chown "$SERVICE_USER:$SERVICE_USER" "$BASE_DIR"
 
-    setup_project "$SCOUT_NAME"    "Arbitrage Selling Scout" "$SCOUT_REPO"    "$SCOUT_ENTRY"
-    setup_project "$SCREENER_NAME" "Pre-Market Screener"     "$SCREENER_REPO" "$SCREENER_ENTRY"
+    if (( SETUP_SCOUT )); then
+        setup_project "$SCOUT_NAME" "Arbitrage Selling Scout" "$SCOUT_REPO" "$SCOUT_ENTRY"
+    else
+        skip "Arbitrage Scout uebersprungen (--no-scout)"
+    fi
+
+    if (( SETUP_SCREENER )); then
+        setup_project "$SCREENER_NAME" "Pre-Market Screener" "$SCREENER_REPO" "$SCREENER_ENTRY"
+    else
+        skip "Pre-Market Screener uebersprungen (--no-screener)"
+    fi
 
     install_cron
     install_listener_service
