@@ -1,8 +1,8 @@
 # Arbitrage Selling Scout
 
 Findet Preisunterschiede zwischen Einkauf (Amazon / AliExpress) und Verkauf (eBay)
-und prüft mit Google Gemini, ob es sich überhaupt um dasselbe Produkt handelt.
-Ausgelegt auf headless Betrieb per Cronjob auf einem Linux-VPS.
+und prüft per LLM — Google Gemini oder Groq — ob es sich überhaupt um dasselbe
+Produkt handelt. Ausgelegt auf headless Betrieb per Cronjob auf einem Linux-VPS.
 
 Der teure Fehler im Arbitragehandel ist nicht die falsche Marge, sondern das
 falsche Produkt: ein 5er-Pack gegen ein Einzelstück, 128 GB gegen 256 GB,
@@ -17,7 +17,8 @@ bleibt deterministisch in `calculator.py`.
 | `.env` | Nur Secrets (API-Keys). Gehört **nicht** ins Repo, Vorlage: `.env.example`. |
 | `config.py` | Lädt und validiert beides über Pydantic Settings. |
 | `models.py` | Gemeinsame Datenmodelle (`Offer`, `CandidatePair`). |
-| `gemini_matcher.py` | Semantischer Abgleich per Gemini, Structured Output, Retry, Rate-Limit. |
+| `matcher.py` | Antwortschema, Prompt, Retry, Rate-Limit, Cache, Offline-Heuristik. |
+| `llm_providers.py` | Austauschbare LLM-Backends: Gemini und Groq. |
 | `calculator.py` | Netto-Margenrechner mit Decimal-Arithmetik. |
 | `sources.py` | Woher die Angebote kommen (CSV / Mock; erweiterbar um echte APIs). |
 | `scout.py` | Orchestrator mit CLI. |
@@ -42,6 +43,9 @@ API-Key fällt der Matcher automatisch auf eine Titel-Heuristik zurück — die
 reicht, um die Pipeline zu prüfen, aber ausdrücklich **nicht** für echte
 Kaufentscheidungen.
 
+In `.env` genügt der Key des Backends, das du verwendest: `GEMINI_API_KEY`
+oder `GROQ_API_KEY`.
+
 ## CLI
 
 ```
@@ -51,7 +55,8 @@ Kaufentscheidungen.
 --config PFAD          Alternative Konfigurationsdatei
 --min-roi PROZENT      Mindest-ROI überschreiben
 --min-profit EUR       Mindestgewinn überschreiben
---offline              Heuristik statt Gemini, Export bleibt aktiv
+--provider NAME        LLM-Backend für diesen Lauf (gemini | groq)
+--offline              Heuristik statt LLM, Export bleibt aktiv
 --no-prefilter         Jedes Paar ans LLM schicken (teurer, vollständiger)
 --no-export            Nicht auf die Platte schreiben
 --no-lock              Ohne Lockfile laufen
@@ -62,6 +67,32 @@ Kaufentscheidungen.
 ```
 
 Exit-Codes: `0` ok, `1` Laufzeitfehler, `2` Konfigurationsfehler, `130` abgebrochen.
+
+## LLM-Backends
+
+Umschaltbar über `llm.provider` in `config.yaml` oder `--provider` pro Lauf:
+
+| | Gemini | Groq |
+|---|---|---|
+| Schema | echtes `response_schema`, serverseitig erzwungen | JSON-Modus; `json_schema` nur bei manchen Modellen |
+| Tempo | solide | deutlich schneller |
+| Rate-Limit | großzügig | im Free-Tier eng (Default 30/min) |
+| Key | `GEMINI_API_KEY` | `GROQ_API_KEY` |
+
+```bash
+python scout.py --provider groq          # Backend für diesen Lauf
+python scout.py --provider gemini --limit 20
+```
+
+Nötig ist nur der Key des Providers, den du tatsächlich nutzt. Fehlt er, fällt
+der Lauf auf die Titel-Heuristik zurück, statt abzubrechen — im Report und im
+Log als `heuristic` gekennzeichnet.
+
+Setzt du bei Groq `json_schema_mode: true` und das Modell unterstützt es nicht,
+schaltet der Provider nach der ersten Ablehnung selbsttätig auf den JSON-Modus
+um und protokolliert das. Der Lauf geht dadurch nicht verloren. Groq wechselt
+sein Modellangebot häufiger als Google — vor dem ersten Lauf lohnt ein Blick in
+die [aktuelle Modellliste](https://console.groq.com/docs/models).
 
 ## Die Rechnung
 
@@ -193,14 +224,15 @@ pip install -r requirements-dev.txt
 python -m pytest tests -q
 ```
 
-40 Tests, ohne Netzwerk. Der Online-Pfad wird mit einem eingeschleusten
-Fake-Client geprüft: Retry bei 429/5xx, Abbruch nach `max_retries`, kein Retry
-bei fachlichen Fehlern, Weiterlaufen nach Einzelfehlern.
+57 Tests, ohne Netzwerk. Der Online-Pfad wird mit eingeschleusten
+Fake-Providern geprüft: Retry bei 429/5xx, Abbruch nach `max_retries`, kein
+Retry bei fachlichen Fehlern, Weiterlaufen nach Einzelfehlern, und für Groq der
+Rückfall von `json_schema` auf den JSON-Modus.
 
 ## Haftungsausschluss
 
 Das Werkzeug liefert eine Entscheidungsgrundlage, keine Kaufentscheidung.
-LLM-Urteile können falsch sein; `gemini.min_confidence` und der Retourenpuffer
+LLM-Urteile können falsch sein; `llm.min_confidence` und der Retourenpuffer
 begrenzen das Risiko, beseitigen es aber nicht. Preise, Gebühren und
 Verfügbarkeiten ändern sich zwischen Lauf und Kauf. Steuerliche Behandlung
 (§ 19 UStG vs. Regelbesteuerung, Einfuhrumsatzsteuer bei Drittlandsware) ist

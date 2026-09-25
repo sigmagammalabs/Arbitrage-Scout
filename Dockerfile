@@ -26,7 +26,7 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY config.py calculator.py gemini_matcher.py logging_utils.py models.py sources.py scout.py ./
+COPY config.py calculator.py llm_providers.py matcher.py logging_utils.py models.py sources.py scout.py ./
 COPY config.yaml ./
 
 # Unprivilegierter Nutzer; Datenverzeichnisse gehoeren ihm.
@@ -36,7 +36,7 @@ RUN useradd --create-home --uid 10001 scout \
 USER scout
 
 # Frueher Fehlschlag beim Build, falls ein Modul kaputt ist.
-RUN python -c "import config, calculator, gemini_matcher, models, sources, scout"
+RUN python -c "import config, calculator, llm_providers, matcher, models, sources, scout"
 
 # Secrets kommen zur Laufzeit ueber --env-file, nie ins Image.
 ENTRYPOINT ["python", "scout.py"]

@@ -13,10 +13,10 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from config import GeminiConfig  # noqa: E402
-from gemini_matcher import (  # noqa: E402
-    GeminiMatcher,
-    MatcherError,
+from config import LLMConfig  # noqa: E402
+from llm_providers import LLMError, parse_json_payload  # noqa: E402
+from matcher import (  # noqa: E402
+    ProductMatcher,
     ProductMatchResult,
     build_prompt,
 )
@@ -53,8 +53,8 @@ def make_pair(
 
 
 @pytest.fixture
-def offline_matcher() -> GeminiMatcher:
-    return GeminiMatcher(api_key=None, config=GeminiConfig(), offline=True)
+def offline_matcher() -> ProductMatcher:
+    return ProductMatcher(None, LLMConfig())
 
 
 # --- Schema ----------------------------------------------------------------
@@ -90,53 +90,43 @@ def test_prompt_enthaelt_beide_angebote_und_regeln() -> None:
 
 
 # --- Antwort-Parsing -------------------------------------------------------
-class _Response:
-    def __init__(self, parsed: object = None, text: str | None = None) -> None:
-        self.parsed = parsed
-        self.text = text
-        self.prompt_feedback = None
-        self.candidates = []
+def test_reines_json_wird_gelesen() -> None:
+    raw = '{"is_match": true, "confidence": 0.91}'
+    assert parse_json_payload(raw, ProductMatchResult).confidence == pytest.approx(0.91)
 
 
-def test_parsed_objekt_wird_direkt_uebernommen(offline_matcher: GeminiMatcher) -> None:
-    expected = ProductMatchResult(is_match=True, confidence=0.9)
-    assert offline_matcher._parse_response(_Response(parsed=expected)) is expected
-
-
-def test_markdown_umhuellte_antwort_wird_gelesen(offline_matcher: GeminiMatcher) -> None:
+def test_markdown_umhuellte_antwort_wird_gelesen() -> None:
+    """Modelle im reinen JSON-Modus packen die Antwort gern in Code-Fences."""
     raw = '```json\n{"is_match": true, "confidence": 0.91}\n```'
-    result = offline_matcher._parse_response(_Response(text=raw))
+    result = parse_json_payload(raw, ProductMatchResult)
     assert result.is_match is True
     assert result.confidence == pytest.approx(0.91)
 
 
-def test_json_mit_umgebendem_text_wird_gelesen(offline_matcher: GeminiMatcher) -> None:
+def test_json_mit_umgebendem_text_wird_gelesen() -> None:
     raw = 'Hier das Ergebnis: {"is_match": false, "confidence": 0.2} -- Ende.'
-    result = offline_matcher._parse_response(_Response(text=raw))
-    assert result.is_match is False
+    assert parse_json_payload(raw, ProductMatchResult).is_match is False
 
 
-def test_leere_antwort_wirft(offline_matcher: GeminiMatcher) -> None:
-    with pytest.raises(MatcherError):
-        offline_matcher._parse_response(_Response(text=""))
+def test_leere_antwort_wirft() -> None:
+    with pytest.raises(LLMError):
+        parse_json_payload("", ProductMatchResult)
 
 
-def test_antwort_ohne_json_wirft(offline_matcher: GeminiMatcher) -> None:
-    with pytest.raises(MatcherError):
-        offline_matcher._parse_response(_Response(text="Kann ich nicht beantworten."))
+def test_antwort_ohne_json_wirft() -> None:
+    with pytest.raises(LLMError):
+        parse_json_payload("Kann ich nicht beantworten.", ProductMatchResult)
 
 
 # --- Entscheidungslogik ----------------------------------------------------
 def test_zu_geringe_confidence_wird_abgelehnt() -> None:
-    matcher = GeminiMatcher(
-        api_key=None, config=GeminiConfig(min_confidence=0.8), offline=True
-    )
+    matcher = ProductMatcher(None, LLMConfig(min_confidence=0.8))
     decision = matcher._decide(ProductMatchResult(is_match=True, confidence=0.5))
     assert decision.accepted is False
     assert "Confidence" in decision.reason
 
 
-def test_gebindehinweis_landet_in_der_begruendung(offline_matcher: GeminiMatcher) -> None:
+def test_gebindehinweis_landet_in_der_begruendung(offline_matcher: ProductMatcher) -> None:
     decision = offline_matcher._decide(
         ProductMatchResult(
             is_match=True,
@@ -150,28 +140,28 @@ def test_gebindehinweis_landet_in_der_begruendung(offline_matcher: GeminiMatcher
 
 
 # --- Offline-Heuristik -----------------------------------------------------
-def test_heuristik_erkennt_gebindegroesse(offline_matcher: GeminiMatcher) -> None:
+def test_heuristik_erkennt_gebindegroesse(offline_matcher: ProductMatcher) -> None:
     decision = offline_matcher.match(make_pair())
     assert decision.result.package_quantity_source == 6
     assert decision.result.package_quantity_target == 1
     assert decision.offline is True
 
 
-def test_heuristik_lehnt_widerspruechliche_ean_ab(offline_matcher: GeminiMatcher) -> None:
+def test_heuristik_lehnt_widerspruechliche_ean_ab(offline_matcher: ProductMatcher) -> None:
     pair = make_pair(source_ean="4006387079321", target_ean="1234567890123")
     decision = offline_matcher.match(pair)
     assert decision.accepted is False
     assert "EAN" in (decision.result.mismatch_reason or "")
 
 
-def test_gleiche_ean_ergibt_hohe_confidence(offline_matcher: GeminiMatcher) -> None:
+def test_gleiche_ean_ergibt_hohe_confidence(offline_matcher: ProductMatcher) -> None:
     pair = make_pair(source_ean="4006387079321", target_ean="4006387079321")
     decision = offline_matcher.match(pair)
     assert decision.result.confidence >= 0.8
     assert decision.accepted is True
 
 
-def test_cache_verhindert_zweiten_aufruf(offline_matcher: GeminiMatcher) -> None:
+def test_cache_verhindert_zweiten_aufruf(offline_matcher: ProductMatcher) -> None:
     pair = make_pair()
     offline_matcher.match(pair)
     offline_matcher.match(pair)
@@ -179,17 +169,10 @@ def test_cache_verhindert_zweiten_aufruf(offline_matcher: GeminiMatcher) -> None
     assert offline_matcher.stats["offline_calls"] == 1
 
 
-# --- Fehlerklassifikation --------------------------------------------------
-def test_netzwerkfehler_gilt_als_wiederholbar(offline_matcher: GeminiMatcher) -> None:
-    assert offline_matcher._is_retryable(TimeoutError("timed out")) is True
-    assert offline_matcher._is_retryable(ConnectionError("connection reset")) is True
-    assert offline_matcher._is_retryable(RuntimeError("429 rate limit exceeded")) is True
-
-
-def test_fachlicher_fehler_gilt_nicht_als_wiederholbar(offline_matcher: GeminiMatcher) -> None:
-    assert offline_matcher._is_retryable(ValueError("invalid argument")) is False
-
-
-def test_ohne_sdk_und_ohne_key_kein_online_matcher() -> None:
-    with pytest.raises(MatcherError):
-        GeminiMatcher(api_key=None, config=GeminiConfig(), offline=False)
+# --- Offline-Kennzeichnung -------------------------------------------------
+def test_ohne_provider_ist_der_matcher_offline(offline_matcher: ProductMatcher) -> None:
+    """Wichtig fuer den Report: heuristische Treffer duerfen nicht wie
+    LLM-gepruefte aussehen."""
+    assert offline_matcher.offline is True
+    assert offline_matcher.model_label == "heuristic"
+    assert offline_matcher.match(make_pair()).model == "heuristic"

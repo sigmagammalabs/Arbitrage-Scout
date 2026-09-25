@@ -41,10 +41,10 @@ from pydantic import BaseModel
 
 from calculator import MarginBreakdown, MarginCalculator, format_breakdown
 from config import ConfigError, Settings, load_settings
-from gemini_matcher import (
-    GeminiMatcher,
+from matcher import (
     MatchDecision,
     MatcherError,
+    ProductMatcher,
     guess_package_quantity,
 )
 from logging_utils import RUN_ID, get_logger, setup_logging
@@ -120,13 +120,16 @@ class Scout:
         dry_run: bool = False,
         offline: bool = False,
         use_prefilter: bool = True,
+        provider_name: str | None = None,
     ) -> None:
         self.settings = settings
         self.dry_run = dry_run
         self.calculator = MarginCalculator.from_settings(settings)
         self.source: OfferSource = build_source(settings)
         # Im Dry-Run wird grundsaetzlich nicht gegen die API gesprochen.
-        self.matcher = GeminiMatcher.from_settings(settings, offline=offline or dry_run)
+        self.matcher = ProductMatcher.from_settings(
+            settings, offline=offline or dry_run, provider_name=provider_name
+        )
         self.use_prefilter = use_prefilter
         self.stats = {
             "seen": 0,
@@ -201,11 +204,12 @@ class Scout:
         started = time.monotonic()
 
         logger.info(
-            "Lauf %s gestartet | Kategorie: %s | Limit: %d | Modus: %s",
+            "Lauf %s gestartet | Kategorie: %s | Limit: %d | Modus: %s | Backend: %s",
             RUN_ID,
             category.name if category else "alle",
             max_items,
             "DRY-RUN" if self.dry_run else "live",
+            self.matcher.model_label,
         )
 
         try:
@@ -508,9 +512,14 @@ def build_parser() -> argparse.ArgumentParser:
         "--min-profit", type=float, metavar="EUR", help="Mindestgewinn ueberschreiben."
     )
     parser.add_argument(
+        "--provider",
+        choices=["gemini", "groq"],
+        help="LLM-Backend fuer diesen Lauf (Standard: llm.provider aus config.yaml).",
+    )
+    parser.add_argument(
         "--offline",
         action="store_true",
-        help="Heuristisch matchen statt Gemini zu befragen (Export bleibt aktiv).",
+        help="Heuristisch matchen statt ein LLM zu befragen (Export bleibt aktiv).",
     )
     parser.add_argument(
         "--no-prefilter",
@@ -549,6 +558,8 @@ def _apply_overrides(settings: Settings, args: argparse.Namespace) -> None:
         settings.config.margin.min_roi_percent = args.min_roi
     if args.min_profit is not None:
         settings.config.margin.min_profit_eur = args.min_profit
+    if args.provider:
+        settings.config.llm.provider = args.provider  # type: ignore[assignment]
     if args.log_level:
         settings.config.logging.level = args.log_level  # type: ignore[assignment]
     if args.dry_run:
@@ -574,8 +585,13 @@ def main(argv: list[str] | None = None) -> int:
         print(f"Logdatei:       {settings.log_file}")
         print(f"Ergebnisse:     {settings.results_dir}")
         print(f"Datenquelle:    {cfg.sources.provider}")
-        print(f"Gemini-Modell:  {cfg.gemini.model}")
-        print(f"GEMINI_API_KEY: {'gesetzt' if settings.secrets.has_gemini_key else 'FEHLT'}")
+        provider = cfg.llm.provider
+        model = cfg.groq.model if provider == "groq" else cfg.gemini.model
+        print(f"LLM-Provider:   {provider} ({model})")
+        print(f"GEMINI_API_KEY: {'gesetzt' if settings.secrets.has_gemini_key else 'fehlt'}")
+        print(f"GROQ_API_KEY:   {'gesetzt' if settings.secrets.has_groq_key else 'fehlt'}")
+        if not settings.secrets.has_key(provider):
+            print(f"  ! Kein Key fuer '{provider}' - Laeufe fallen auf die Heuristik zurueck.")
         print(f"Schwellen:      ROI >= {cfg.margin.min_roi_percent} %, "
               f"Gewinn >= {cfg.margin.min_profit_eur} EUR")
         print(f"Kategorien:     {', '.join(c.name for c in cfg.search.categories) or 'keine'}")
@@ -612,6 +628,7 @@ def _execute(settings: Settings, args: argparse.Namespace) -> int:
             dry_run=args.dry_run,
             offline=args.offline,
             use_prefilter=not args.no_prefilter,
+            provider_name=args.provider,
         )
     except MatcherError as exc:
         logger.error("Matcher nicht initialisierbar: %s", exc)

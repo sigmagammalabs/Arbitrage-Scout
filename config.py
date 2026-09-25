@@ -78,8 +78,15 @@ class TaxConfig(BaseModel):
         return self
 
 
-class GeminiConfig(BaseModel):
-    model: str = "gemini-2.5-flash"
+class ProviderConfig(BaseModel):
+    """Einstellungen, die jedes LLM-Backend braucht.
+
+    Retry- und Rate-Limit-Werte stehen bewusst pro Provider und nicht global:
+    Geminis Kontingente unterscheiden sich deutlich von denen bei Groq, wo der
+    kostenlose Tarif schon bei wenigen Anfragen pro Minute bremst.
+    """
+
+    model: str
     temperature: float = Field(0.0, ge=0.0, le=2.0)
     max_output_tokens: int = Field(1024, gt=0, le=65536)
     timeout_seconds: float = Field(30.0, gt=0.0)
@@ -87,22 +94,48 @@ class GeminiConfig(BaseModel):
     initial_backoff_seconds: float = Field(2.0, gt=0.0)
     max_backoff_seconds: float = Field(60.0, gt=0.0)
     requests_per_minute: int = Field(60, gt=0)
-    min_confidence: float = Field(0.80, ge=0.0, le=1.0)
-    thinking_budget: int = Field(0, ge=0)
 
     @field_validator("model")
     @classmethod
     def _model_not_empty(cls, v: str) -> str:
         v = v.strip()
         if not v:
-            raise ValueError("gemini.model darf nicht leer sein.")
+            raise ValueError("model darf nicht leer sein.")
         return v
 
     @model_validator(mode="after")
-    def _backoff_ordered(self) -> GeminiConfig:
+    def _backoff_ordered(self) -> ProviderConfig:
         if self.max_backoff_seconds < self.initial_backoff_seconds:
             raise ValueError("max_backoff_seconds muss >= initial_backoff_seconds sein.")
         return self
+
+
+class GeminiConfig(ProviderConfig):
+    model: str = "gemini-2.5-flash"
+    # 0 schaltet das interne "Nachdenken" ab -- schneller und guenstiger. Der
+    # Produktabgleich ist eine Klassifikation, keine Herleitung.
+    thinking_budget: int = Field(0, ge=0)
+
+
+class GroqConfig(ProviderConfig):
+    model: str = "llama-3.3-70b-versatile"
+    requests_per_minute: int = Field(30, gt=0)
+    # Echte Schema-Erzwingung koennen nur einige Groq-Modelle. Standard ist
+    # deshalb der breit unterstuetzte JSON-Modus; der Provider faellt bei einer
+    # Ablehnung ohnehin automatisch darauf zurueck.
+    json_schema_mode: bool = False
+
+
+class LLMConfig(BaseModel):
+    """Welches Backend den Abgleich uebernimmt und ab wann sein Urteil zaehlt."""
+
+    provider: Literal["gemini", "groq"] = "gemini"
+    min_confidence: float = Field(0.80, ge=0.0, le=1.0)
+
+    @field_validator("provider", mode="before")
+    @classmethod
+    def _normalise(cls, v: Any) -> Any:
+        return v.strip().lower() if isinstance(v, str) else v
 
 
 class CsvSourceConfig(BaseModel):
@@ -190,6 +223,11 @@ class LoggingConfig(BaseModel):
 # ---------------------------------------------------------------------------
 # Secrets aus .env / Umgebung
 # ---------------------------------------------------------------------------
+# Provider-Name -> Feldname in Secrets. Haelt die Pruefung an einer Stelle,
+# wenn spaeter ein weiteres Backend dazukommt.
+PROVIDER_KEY_FIELDS = {"gemini": "gemini_api_key", "groq": "groq_api_key"}
+
+
 class Secrets(BaseSettings):
     """Zugangsdaten. Als ``SecretStr`` gehalten, damit sie nicht in Logs oder
     Tracebacks landen."""
@@ -202,6 +240,7 @@ class Secrets(BaseSettings):
     )
 
     gemini_api_key: SecretStr | None = None
+    groq_api_key: SecretStr | None = None
 
     ebay_app_id: SecretStr | None = None
     ebay_cert_id: SecretStr | None = None
@@ -217,19 +256,39 @@ class Secrets(BaseSettings):
     telegram_bot_token: SecretStr | None = None
     telegram_chat_id: str | None = None
 
-    @property
-    def has_gemini_key(self) -> bool:
-        return bool(self.gemini_api_key and self.gemini_api_key.get_secret_value().strip())
+    def has_key(self, provider: str) -> bool:
+        field = PROVIDER_KEY_FIELDS.get(provider.strip().lower())
+        if field is None:
+            return False
+        value: SecretStr | None = getattr(self, field, None)
+        return bool(value and value.get_secret_value().strip())
 
-    def require_gemini_key(self) -> str:
+    def require_key(self, provider: str) -> str:
         """Key im Klartext -- nur unmittelbar vor dem SDK-Aufruf verwenden."""
-        if not self.has_gemini_key:
+        provider = provider.strip().lower()
+        field = PROVIDER_KEY_FIELDS.get(provider)
+        if field is None:
+            raise ConfigError(f"Unbekannter LLM-Provider: {provider}")
+        if not self.has_key(provider):
             raise ConfigError(
-                "GEMINI_API_KEY fehlt. Trage ihn in .env ein "
+                f"{field.upper()} fehlt. Trage ihn in .env ein "
                 "(Vorlage: .env.example) oder setze die Umgebungsvariable."
             )
-        assert self.gemini_api_key is not None  # durch has_gemini_key garantiert
-        return self.gemini_api_key.get_secret_value().strip()
+        return getattr(self, field).get_secret_value().strip()
+
+    @property
+    def has_gemini_key(self) -> bool:
+        return self.has_key("gemini")
+
+    @property
+    def has_groq_key(self) -> bool:
+        return self.has_key("groq")
+
+    def require_gemini_key(self) -> str:
+        return self.require_key("gemini")
+
+    def require_groq_key(self) -> str:
+        return self.require_key("groq")
 
 
 # ---------------------------------------------------------------------------
@@ -291,7 +350,9 @@ class AppConfig(BaseSettings):
     margin: MarginConfig = Field(default_factory=MarginConfig)
     costs: CostConfig = Field(default_factory=CostConfig)
     tax: TaxConfig = Field(default_factory=TaxConfig)
+    llm: LLMConfig = Field(default_factory=LLMConfig)
     gemini: GeminiConfig = Field(default_factory=GeminiConfig)
+    groq: GroqConfig = Field(default_factory=GroqConfig)
     sources: SourcesConfig = Field(default_factory=SourcesConfig)
     search: SearchConfig = Field(default_factory=SearchConfig)
     output: OutputConfig = Field(default_factory=OutputConfig)

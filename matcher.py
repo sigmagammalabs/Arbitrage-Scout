@@ -1,20 +1,22 @@
-"""Semantischer Produktabgleich per Google Gemini.
+"""Semantischer Produktabgleich per LLM.
 
 Der Preisvergleich allein ist wertlos, wenn die beiden Angebote nicht dasselbe
 Produkt sind. Genau hier liegt das Geld -- und das Risiko: ein 5er-Pack gegen
 ein Einzelstueck oder die 128-GB- gegen die 64-GB-Variante zu rechnen fuehrt
 zuverlaessig zum Fehlkauf.
 
-Das Modul nutzt das aktuelle ``google-genai`` SDK mit Structured Outputs, d. h.
-Gemini antwortet gegen ein Pydantic-Schema statt in Freitext. Dazu kommen:
-Rate-Limiting, exponentielles Backoff bei 429/5xx, ein Ergebnis-Cache und ein
-Offline-Modus fuer Testlaeufe ohne API-Kosten.
+Dieses Modul haelt alles, was vom Backend unabhaengig ist: das Antwortschema,
+den Prompt, Rate-Limiting, Wiederholungslogik, Ergebnis-Cache und die
+Bewertung des Modellurteils. Der eigentliche Aufruf geht an einen Provider aus
+:mod:`llm_providers` -- aktuell Google Gemini oder Groq.
+
+Ohne API-Key faellt der Matcher auf eine Titel-Heuristik zurueck. Die reicht,
+um die Pipeline zu pruefen, ausdruecklich nicht fuer Kaufentscheidungen.
 """
 
 from __future__ import annotations
 
 import hashlib
-import json
 import re
 import threading
 import time
@@ -23,32 +25,13 @@ from typing import Any
 
 from pydantic import BaseModel, Field, field_validator
 
-from config import GeminiConfig, Settings
+from config import LLMConfig, Settings
+from llm_providers import LLMError, LLMProvider, build_provider
 from logging_utils import get_logger
 from models import CandidatePair, Offer
 
 logger = get_logger(__name__)
 
-# Das SDK ist optional importierbar, damit Kalkulation und Tests auch ohne
-# installiertes Paket laufen. Fehlt es, schlaegt erst der erste Aufruf fehl.
-try:
-    from google import genai
-    from google.genai import errors as genai_errors
-    from google.genai import types as genai_types
-
-    GENAI_AVAILABLE = True
-except ImportError:  # pragma: no cover - haengt an der Installation
-    genai = None  # type: ignore[assignment]
-    genai_errors = None  # type: ignore[assignment]
-    genai_types = None  # type: ignore[assignment]
-    GENAI_AVAILABLE = False
-
-
-# HTTP-Codes, bei denen ein erneuter Versuch sinnvoll ist.
-_RETRYABLE_STATUS = {408, 429, 500, 502, 503, 504}
-_RETRYABLE_STATUS_PATTERN = re.compile(
-    r"\b(?:" + "|".join(str(c) for c in sorted(_RETRYABLE_STATUS)) + r")\b"
-)
 _QUANTITY_PATTERN = re.compile(
     r"(\d{1,4})\s*(?:er[- ]?pack|x\b|stk\.?|st(?:ue|ü)ck|pcs|pieces|pack(?:ung)?|set)",
     re.IGNORECASE,
@@ -63,10 +46,12 @@ class MatcherError(RuntimeError):
 # Antwortschema (Structured Output)
 # ---------------------------------------------------------------------------
 class ProductMatchResult(BaseModel):
-    """Schema, gegen das Gemini antwortet.
+    """Schema, gegen das das Modell antwortet.
 
-    Feldreihenfolge ist Absicht: Das Modell fuellt erst die beobachtbaren Fakten
-    (Mengen, Attribute) und leitet daraus das Urteil ab.
+    Feldreihenfolge ist Absicht: Erst die beobachtbaren Fakten (Mengen,
+    Attribute), daraus abgeleitet das Urteil. Das gilt besonders fuer Groq im
+    reinen JSON-Modus, wo das Schema nur als Prompt-Vorgabe wirkt und die
+    Reihenfolge die Generierung tatsaechlich lenkt.
     """
 
     package_quantity_source: int = Field(
@@ -143,7 +128,7 @@ class ProductMatchResult(BaseModel):
 
 
 class MatchDecision(BaseModel):
-    """Das Gemini-Ergebnis plus die Bewertung durch den Scout."""
+    """Das Modellergebnis plus die Bewertung durch den Scout."""
 
     result: ProductMatchResult
     accepted: bool
@@ -299,7 +284,8 @@ class RateLimiter:
     """Gleitendes Zeitfenster: hoechstens N Aufrufe pro Minute.
 
     Bremst vor dem Aufruf, statt sich auf 429-Antworten zu verlassen -- das
-    schont das Kontingent und macht Cron-Laeufe berechenbar.
+    schont das Kontingent und macht Cron-Laeufe berechenbar. Bei Groq ist das
+    kein Luxus: der kostenlose Tarif bremst schon bei wenigen Anfragen.
     """
 
     def __init__(self, max_per_minute: int) -> None:
@@ -326,53 +312,64 @@ class RateLimiter:
 # ---------------------------------------------------------------------------
 # Matcher
 # ---------------------------------------------------------------------------
-class GeminiMatcher:
+class ProductMatcher:
     """Kapselt saemtliche LLM-Aufrufe des Scouts.
 
-    Im Offline-Modus (``offline=True``, z. B. bei ``--dry-run`` ohne API-Key)
-    liefert der Matcher eine heuristische Einschaetzung aus Titelvergleich und
-    Mengenerkennung -- gut genug, um die Pipeline zu testen, ausdruecklich nicht
-    gut genug fuer echte Kaufentscheidungen.
+    Ohne Provider (``provider=None``) arbeitet der Matcher offline: eine
+    heuristische Einschaetzung aus Titelvergleich und Mengenerkennung. Gut
+    genug, um die Pipeline zu testen, nicht fuer echte Kaufentscheidungen.
     """
 
     def __init__(
         self,
-        api_key: str | None,
-        config: GeminiConfig,
+        provider: LLMProvider | None,
+        llm_config: LLMConfig | None = None,
         *,
-        offline: bool = False,
         cache_enabled: bool = True,
     ) -> None:
-        self.config = config
-        self.offline = offline
+        self.provider = provider
+        self.llm = llm_config or LLMConfig()
+        self.offline = provider is None
         self._cache: dict[str, ProductMatchResult] = {}
         self._cache_enabled = cache_enabled
-        self._limiter = RateLimiter(config.requests_per_minute)
-        self._client: Any = None
+        self._limiter = (
+            RateLimiter(provider.config.requests_per_minute) if provider else None
+        )
         self.stats = {"api_calls": 0, "cache_hits": 0, "errors": 0, "offline_calls": 0}
 
-        if not self.offline:
-            if not GENAI_AVAILABLE:
-                raise MatcherError(
-                    "Paket 'google-genai' fehlt. Installation: pip install google-genai "
-                    "-- oder den Matcher mit offline=True betreiben."
-                )
-            if not api_key:
-                raise MatcherError("Kein GEMINI_API_KEY uebergeben.")
-            self._client = genai.Client(api_key=api_key)
-
     @classmethod
-    def from_settings(cls, settings: Settings, *, offline: bool = False) -> GeminiMatcher:
+    def from_settings(
+        cls,
+        settings: Settings,
+        *,
+        offline: bool = False,
+        provider_name: str | None = None,
+    ) -> ProductMatcher:
         """Matcher aus den Settings bauen.
 
-        Ohne API-Key wird automatisch offline gearbeitet -- der Lauf bricht nicht
-        ab, die Ergebnisse sind aber als heuristisch markiert.
+        Fehlt der API-Key des gewaehlten Providers, wird automatisch offline
+        gearbeitet -- der Lauf bricht nicht ab, die Ergebnisse sind aber als
+        heuristisch markiert.
         """
-        if not offline and not settings.secrets.has_gemini_key:
-            logger.warning("Kein GEMINI_API_KEY gefunden - Matcher laeuft heuristisch (offline).")
+        name = (provider_name or settings.config.llm.provider).strip().lower()
+
+        if not offline and not settings.secrets.has_key(name):
+            logger.warning(
+                "Kein API-Key fuer Provider '%s' gefunden - Matcher laeuft heuristisch (offline).",
+                name,
+            )
             offline = True
-        api_key = None if offline else settings.secrets.require_gemini_key()
-        return cls(api_key=api_key, config=settings.config.gemini, offline=offline)
+
+        if offline:
+            return cls(None, settings.config.llm)
+
+        try:
+            provider = build_provider(settings, name)
+        except LLMError as exc:
+            raise MatcherError(str(exc)) from exc
+
+        logger.info("LLM-Backend: %s", provider.describe())
+        return cls(provider, settings.config.llm)
 
     # -- oeffentliche API -----------------------------------------------------
     def match(self, pair: CandidatePair) -> MatchDecision:
@@ -380,21 +377,20 @@ class GeminiMatcher:
         cache_key = self._cache_key(pair)
         if self._cache_enabled and cache_key in self._cache:
             self.stats["cache_hits"] += 1
-            result = self._cache[cache_key]
-            return self._decide(result, from_cache=True, offline=self.offline)
+            return self._decide(self._cache[cache_key], from_cache=True)
 
         started = time.monotonic()
         if self.offline:
             self.stats["offline_calls"] += 1
             result = self._heuristic_match(pair)
         else:
-            result = self._call_api(build_prompt(pair))
+            result = self._call_provider(build_prompt(pair))
 
         if self._cache_enabled:
             self._cache[cache_key] = result
 
         latency = int((time.monotonic() - started) * 1000)
-        return self._decide(result, latency_ms=latency, offline=self.offline)
+        return self._decide(result, latency_ms=latency)
 
     def match_many(self, pairs: list[CandidatePair]) -> list[tuple[CandidatePair, MatchDecision]]:
         """Mehrere Paare nacheinander pruefen.
@@ -412,163 +408,58 @@ class GeminiMatcher:
                 out.append((pair, self._error_decision(str(exc))))
         return out
 
-    # -- API-Aufruf -----------------------------------------------------------
-    def _call_api(self, prompt: str) -> ProductMatchResult:
-        """Gemini mit Structured Output aufrufen, inklusive Backoff."""
-        cfg = self._generation_config()
-        delay = self.config.initial_backoff_seconds
-        last_error: Exception | None = None
+    # -- Provider-Aufruf ------------------------------------------------------
+    def _call_provider(self, prompt: str) -> ProductMatchResult:
+        """Provider aufrufen, mit Rate-Limit und exponentiellem Backoff.
 
-        for attempt in range(1, self.config.max_retries + 2):
-            self._limiter.acquire()
+        Die Wiederholungslogik liegt bewusst hier und nicht im SDK: So gilt fuer
+        jedes Backend dasselbe Verhalten und jeder Versuch steht im Log.
+        """
+        assert self.provider is not None  # durch self.offline ausgeschlossen
+        retry = self.provider.config
+        delay = retry.initial_backoff_seconds
+        last_error: Exception | None = None
+        schema_retry_used = False
+
+        for attempt in range(1, retry.max_retries + 2):
+            if self._limiter is not None:
+                self._limiter.acquire()
             try:
                 self.stats["api_calls"] += 1
-                response = self._client.models.generate_content(
-                    model=self.config.model,
-                    contents=prompt,
-                    config=cfg,
+                return self.provider.complete_json(
+                    SYSTEM_INSTRUCTION, prompt, ProductMatchResult
                 )
-                return self._parse_response(response)
-            except MatcherError as exc:
-                # Unbrauchbare Antwort: einmal neu anfragen, danach aufgeben.
-                last_error = exc
-                logger.warning("Antwort unbrauchbar (Versuch %d): %s", attempt, exc)
-                if attempt > 1:
-                    break
             except Exception as exc:
                 last_error = exc
-                if not self._is_retryable(exc):
-                    raise MatcherError(f"Gemini-Aufruf fehlgeschlagen: {exc}") from exc
+                if not self.provider.is_retryable(exc):
+                    # Unbrauchbare Antwort einmal neu anfragen -- kleine Modelle
+                    # verhaspeln sich gelegentlich beim JSON. Alles andere
+                    # (ungueltiges Argument, unbekanntes Modell) bleibt endgueltig.
+                    if isinstance(exc, LLMError) and not schema_retry_used:
+                        schema_retry_used = True
+                        logger.warning("Antwort unbrauchbar (Versuch %d): %s", attempt, exc)
+                        continue
+                    self.stats["errors"] += 1
+                    raise MatcherError(f"{self.provider.name}-Aufruf fehlgeschlagen: {exc}") from exc
+
                 logger.warning(
-                    "Gemini voruebergehend nicht verfuegbar (Versuch %d/%d): %s",
+                    "%s voruebergehend nicht verfuegbar (Versuch %d/%d): %s",
+                    self.provider.name,
                     attempt,
-                    self.config.max_retries + 1,
+                    retry.max_retries + 1,
                     exc,
                 )
 
-            if attempt <= self.config.max_retries:
-                sleep_for = min(delay, self.config.max_backoff_seconds)
+            if attempt <= retry.max_retries:
+                sleep_for = min(delay, retry.max_backoff_seconds)
                 logger.debug("Warte %.1f s vor erneutem Versuch", sleep_for)
                 time.sleep(sleep_for)
                 delay *= 2
 
         self.stats["errors"] += 1
         raise MatcherError(
-            f"Gemini nach {self.config.max_retries + 1} Versuchen nicht erreichbar: {last_error}"
-        )
-
-    def _generation_config(self) -> Any:
-        """``GenerateContentConfig`` inklusive Response-Schema."""
-        kwargs: dict[str, Any] = {
-            "system_instruction": SYSTEM_INSTRUCTION,
-            "temperature": self.config.temperature,
-            "max_output_tokens": self.config.max_output_tokens,
-            "response_mime_type": "application/json",
-            "response_schema": ProductMatchResult,
-        }
-        # thinking_config kennt nur ein Teil der Modelle; ein Fehlschlag hier darf
-        # den Lauf nicht kosten.
-        if self.config.thinking_budget >= 0:
-            try:
-                kwargs["thinking_config"] = genai_types.ThinkingConfig(
-                    thinking_budget=self.config.thinking_budget
-                )
-            except Exception:  # pragma: no cover - SDK-/Modellabhaengig
-                logger.debug("ThinkingConfig nicht unterstuetzt, wird uebersprungen.")
-        try:
-            kwargs["http_options"] = genai_types.HttpOptions(
-                timeout=int(self.config.timeout_seconds * 1000)
-            )
-        except Exception:  # pragma: no cover
-            logger.debug("HttpOptions-Timeout nicht unterstuetzt, SDK-Default gilt.")
-        return genai_types.GenerateContentConfig(**kwargs)
-
-    def _parse_response(self, response: Any) -> ProductMatchResult:
-        """Antwort in das Schema ueberfuehren.
-
-        Der bevorzugte Weg ist ``response.parsed``; faellt das aus (abgeschnittene
-        Antwort, in Markdown eingepackt), wird der Rohtext nachverarbeitet.
-        """
-        parsed = getattr(response, "parsed", None)
-        if isinstance(parsed, ProductMatchResult):
-            return parsed
-        if isinstance(parsed, dict):
-            return ProductMatchResult.model_validate(parsed)
-
-        text = (getattr(response, "text", None) or "").strip()
-        if not text:
-            reason = self._blocking_reason(response)
-            raise MatcherError(f"Leere Antwort von Gemini{reason}")
-
-        try:
-            return ProductMatchResult.model_validate_json(text)
-        except Exception:
-            pass
-
-        cleaned = self._extract_json(text)
-        if cleaned is None:
-            raise MatcherError(f"Antwort enthaelt kein JSON: {text[:200]!r}")
-        try:
-            return ProductMatchResult.model_validate(cleaned)
-        except Exception as exc:
-            raise MatcherError(f"Antwort passt nicht zum Schema: {exc}") from exc
-
-    @staticmethod
-    def _extract_json(text: str) -> dict[str, Any] | None:
-        """JSON aus Markdown-Fences oder umgebendem Text herausloesen."""
-        fence = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.DOTALL)
-        candidate = fence.group(1) if fence else None
-        if candidate is None:
-            start, end = text.find("{"), text.rfind("}")
-            if start == -1 or end <= start:
-                return None
-            candidate = text[start : end + 1]
-        try:
-            data = json.loads(candidate)
-        except json.JSONDecodeError:
-            return None
-        return data if isinstance(data, dict) else None
-
-    @staticmethod
-    def _blocking_reason(response: Any) -> str:
-        """Sicherheitsfilter o. ae. aus der Antwort auslesen, falls vorhanden."""
-        feedback = getattr(response, "prompt_feedback", None)
-        reason = getattr(feedback, "block_reason", None)
-        if reason:
-            return f" (blockiert: {reason})"
-        candidates = getattr(response, "candidates", None) or []
-        if candidates:
-            finish = getattr(candidates[0], "finish_reason", None)
-            if finish:
-                return f" (finish_reason={finish})"
-        return ""
-
-    def _is_retryable(self, exc: Exception) -> bool:
-        """Netzwerkfehler und serverseitige Ueberlast sind wiederholbar."""
-        if genai_errors is not None:
-            if isinstance(exc, getattr(genai_errors, "ServerError", ())):
-                return True
-            if isinstance(exc, getattr(genai_errors, "ClientError", ())):
-                return int(getattr(exc, "code", 0) or 0) in _RETRYABLE_STATUS
-            if isinstance(exc, getattr(genai_errors, "APIError", ())):
-                return int(getattr(exc, "code", 0) or 0) in _RETRYABLE_STATUS
-        if isinstance(exc, (TimeoutError, ConnectionError, OSError)):
-            return True
-        code = getattr(exc, "code", None) or getattr(exc, "status_code", None)
-        if isinstance(code, int) and code in _RETRYABLE_STATUS:
-            return True
-
-        # Letzter Ausweg: Fehler ohne Typ oder Code anhand des Textes einordnen.
-        text = str(exc).lower()
-        if _RETRYABLE_STATUS_PATTERN.search(text):
-            return True
-        return any(
-            token in text
-            for token in (
-                "timeout", "timed out", "deadline", "connection", "unavailable",
-                "rate limit", "resource_exhausted", "too many requests",
-                "internal error", "internal server", "overloaded", "try again",
-            )
+            f"{self.provider.name} nach {retry.max_retries + 1} Versuchen "
+            f"nicht erreichbar: {last_error}"
         )
 
     # -- Bewertung ------------------------------------------------------------
@@ -577,11 +468,10 @@ class GeminiMatcher:
         result: ProductMatchResult,
         *,
         from_cache: bool = False,
-        offline: bool = False,
         latency_ms: int = 0,
     ) -> MatchDecision:
         """Rohes Modellurteil gegen die Mindestsicherheit pruefen."""
-        threshold = self.config.min_confidence
+        threshold = self.llm.min_confidence
         if not result.is_match:
             accepted, reason = False, result.mismatch_reason or "Kein Produktmatch."
         elif result.confidence < threshold:
@@ -600,10 +490,16 @@ class GeminiMatcher:
             accepted=accepted,
             reason=reason,
             from_cache=from_cache,
-            offline=offline,
+            offline=self.offline,
             latency_ms=latency_ms,
-            model="heuristic" if offline else self.config.model,
+            model=self.model_label,
         )
+
+    @property
+    def model_label(self) -> str:
+        if self.provider is None:
+            return "heuristic"
+        return f"{self.provider.name}/{self.provider.model}"
 
     def _error_decision(self, message: str) -> MatchDecision:
         return MatchDecision(
@@ -683,7 +579,8 @@ class GeminiMatcher:
 
     def log_stats(self) -> None:
         logger.info(
-            "Matcher-Statistik: %d API-Aufrufe, %d Cache-Treffer, %d Offline, %d Fehler",
+            "Matcher-Statistik (%s): %d API-Aufrufe, %d Cache-Treffer, %d Offline, %d Fehler",
+            self.model_label,
             self.stats["api_calls"],
             self.stats["cache_hits"],
             self.stats["offline_calls"],
@@ -691,7 +588,7 @@ class GeminiMatcher:
         )
 
 
-if __name__ == "__main__":  # Smoke-Test: `python gemini_matcher.py`
+if __name__ == "__main__":  # Smoke-Test: `python matcher.py`
     from config import load_settings
     from logging_utils import setup_logging
     from models import Marketplace
@@ -718,9 +615,9 @@ if __name__ == "__main__":  # Smoke-Test: `python gemini_matcher.py`
         category="haushalt",
     )
 
-    matcher = GeminiMatcher.from_settings(settings)
+    matcher = ProductMatcher.from_settings(settings)
     decision = matcher.match(demo)
-    print(f"Modell:      {decision.model}")
+    print(f"Backend:     {decision.model}")
     print(f"Angenommen:  {decision.accepted}")
     print(f"Begruendung: {decision.reason}")
     print(f"Mengen:      Quelle {decision.result.package_quantity_source} / "

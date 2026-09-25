@@ -33,7 +33,16 @@ tax:
   # Vorsteuerabzug auf den Einkauf nur, wenn eine EU-Rechnung vorliegt.
   input_vat_deductible: false
 
-# --- Gemini / LLM-Matching -------------------------------------------------
+# --- LLM-Matching -----------------------------------------------------------
+llm:
+  # Welches Backend den semantischen Produktabgleich uebernimmt.
+  #   gemini -- Google Gemini, echte Structured Outputs, grosszuegiges Kontingent
+  #   groq   -- Groq, deutlich schneller und guenstiger, dafuer je nach Modell
+  #             nur JSON-Modus statt erzwungenem Schema
+  provider: "gemini"
+  # Ab dieser Sicherheit gilt ein Match als belastbar. Gilt fuer beide Backends.
+  min_confidence: 0.80
+
 gemini:
   model: "gemini-2.5-flash"
   temperature: 0.0                 # Deterministisch fuer reproduzierbare Matches
@@ -42,9 +51,25 @@ gemini:
   max_retries: 4                   # Exponentielles Backoff bei 429/5xx
   initial_backoff_seconds: 2.0
   max_backoff_seconds: 60.0
-  requests_per_minute: 60          # Client-seitiges Rate-Limiting
-  min_confidence: 0.80             # Ab hier gilt ein Match als belastbar
+  requests_per_minute: 60
   thinking_budget: 0               # 0 = aus (schneller/guenstiger bei 2.5-flash)
+
+groq:
+  # Groq wechselt sein Modellangebot haeufiger als Google. Vor dem ersten Lauf
+  # gegen die aktuelle Liste pruefen: https://console.groq.com/docs/models
+  model: "llama-3.3-70b-versatile"
+  temperature: 0.0
+  max_output_tokens: 1024
+  timeout_seconds: 30
+  max_retries: 4
+  initial_backoff_seconds: 2.0
+  max_backoff_seconds: 60.0
+  # Bewusst niedriger als bei Gemini: der kostenlose Groq-Tarif bremst frueh.
+  requests_per_minute: 30
+  # true erzwingt das Schema serverseitig, koennen aber nicht alle Modelle.
+  # Lehnt das Modell ab, faellt der Provider automatisch auf den JSON-Modus
+  # zurueck -- der Lauf geht also in keinem Fall verloren.
+  json_schema_mode: false
 
 # --- Datenquellen ----------------------------------------------------------
 sources:

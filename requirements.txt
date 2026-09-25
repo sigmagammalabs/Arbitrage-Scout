@@ -1,7 +1,10 @@
 # Laufzeitabhaengigkeiten. Installation:
 #   python -m venv .venv && . .venv/bin/activate && pip install -r requirements.txt
 
-google-genai>=1.20.0,<3.0.0     # offizielles Gemini SDK (from google import genai)
+# LLM-Backends. Beide sind optional: installiert wird, was llm.provider
+# in config.yaml auswaehlt -- der jeweils andere Import wird abgefangen.
+google-genai>=1.20.0,<3.0.0     # Gemini  (from google import genai)
+groq>=0.11.0,<2.0.0             # Groq    (OpenAI-kompatible Chat-API)
 pydantic>=2.7,<3.0
 pydantic-settings>=2.3,<3.0
 PyYAML>=6.0,<7.0
