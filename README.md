@@ -135,8 +135,10 @@ Weg, nach einem Update die Abhängigkeiten nachzuziehen.
 
 ### Installation aus diesem Repository
 
+Das Repository ist oeffentlich, der VPS braucht also keine Zugangsdaten:
+
 ```bash
-REPO=git@github.com:<user>/arbitrage-selling-scout.git
+REPO=https://github.com/sigmagammalabs/Arbitrage-Scout.git
 
 git clone "$REPO" /tmp/scout-bootstrap
 sudo bash /tmp/scout-bootstrap/deploy/vps_setup.sh --scout-repo "$REPO" --dry-run
@@ -147,9 +149,17 @@ Das Skript klont den Code nach `/opt/trading/arbitrage-scout/`, legt beide venvs
 an und installiert die Abhängigkeiten. `bash vps_setup.sh --help` listet alle
 Optionen.
 
-**Privates Repository:** Der VPS braucht Lesezugriff. Sauberste Variante ist ein
-Deploy Key — nur für dieses eine Repository gültig, read-only, jederzeit
-widerrufbar:
+Danach den API-Key eintragen — je nach `llm.provider` `GEMINI_API_KEY` oder
+`GROQ_API_KEY`:
+
+```bash
+sudoedit /opt/trading/arbitrage-scout/.env
+sudo -u trader env -C /opt/trading/arbitrage-scout .venv/bin/python scout.py --check-config
+```
+
+**Wenn du das Repository später auf privat stellst,** braucht der VPS Lesezugriff.
+Sauberste Variante ist ein Deploy Key — nur für dieses eine Repository gültig,
+read-only, jederzeit widerrufbar:
 
 ```bash
 # auf dem VPS
@@ -166,7 +176,7 @@ Host github-scout
 CFG
 ```
 
-Danach als Repo-URL `git@github-scout:<user>/arbitrage-selling-scout.git`
+Danach als Repo-URL `git@github-scout:sigmagammalabs/Arbitrage-Scout.git`
 verwenden. Ein persönlicher Access Token im Klartext in der URL funktioniert
 zwar auch, landet aber in `.git/config` und in der Shell-History — der Deploy
 Key ist die bessere Wahl.
