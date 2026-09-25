@@ -1,0 +1,15 @@
+.env
+*.env
+!.env.example
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+logs/
+data/*.csv
+data/*.json
+!data/offers.example.csv
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/

@@ -1,0 +1,17 @@
+# Zeilenenden im Repository immer LF.
+#
+# Entscheidend fuer deploy/vps_setup.sh: Ein Shell-Skript mit CRLF scheitert
+# auf dem VPS mit "bad interpreter: /usr/bin/env bash^M" -- ein Fehler, der
+# nach einem kaputten Skript aussieht, aber nur ein Zeilenende ist.
+* text=auto eol=lf
+
+*.sh   text eol=lf
+*.py   text eol=lf
+*.yaml text eol=lf
+*.yml  text eol=lf
+
+# Binaerdateien unangetastet lassen
+*.png  binary
+*.jpg  binary
+*.gz   binary
+*.zip  binary

@@ -1,0 +1,100 @@
+# ---------------------------------------------------------------------------
+# Arbitrage Selling Scout - zentrale Konfiguration
+# Alle Werte sind ueber Umgebungsvariablen ueberschreibbar (Praefix: SCOUT__),
+# z. B. SCOUT__MARGIN__MIN_ROI_PERCENT=30
+# Geheimnisse gehoeren NICHT hierher, sondern in .env
+# ---------------------------------------------------------------------------
+
+# --- Schwellenwerte fuer die Kaufempfehlung -------------------------------
+margin:
+  min_roi_percent: 25.0            # Mindest-ROI auf das eingesetzte Kapital
+  min_profit_eur: 12.0             # Mindest-Reingewinn je Einheit
+
+# --- Kostenpauschalen (Verkaeuferseite = eBay) ----------------------------
+costs:
+  shipping_cost_domestic_eur: 5.49 # Inlandsversand DHL Paket o. ae.
+  packaging_cost_eur: 1.20         # Karton, Fuellmaterial, Etikett
+  ebay_fee_percent: 12.0           # Verkaufsprovision auf den Bruttopreis
+  ebay_fixed_fee_eur: 0.35         # Fixe Transaktionsgebuehr je Verkauf
+  return_buffer_percent: 4.0       # Risikopuffer fuer Retouren/Ausfaelle
+  payment_fee_percent: 0.0         # Optional, falls separat abgerechnet
+
+  # Beschaffungsseitige Zusatzkosten (Standard: aus, damit die Basisformel gilt)
+  import_duty_percent: 0.0         # Zoll auf den Einkaufswert (z. B. AliExpress)
+  inbound_shipping_eur: 0.0        # Versand Lieferant -> Lager, falls nicht im Preis
+
+# --- Steuern ---------------------------------------------------------------
+tax:
+  # false = Kleinunternehmer (§19 UStG): USt wird ignoriert, Bruttorechnung.
+  # true  = Regelbesteuerung: USt wird vom Verkaufspreis abgezogen und die
+  #         Vorsteuer aus dem Einkauf gegengerechnet.
+  vat_registered: false
+  vat_rate_percent: 19.0
+  # Vorsteuerabzug auf den Einkauf nur, wenn eine EU-Rechnung vorliegt.
+  input_vat_deductible: false
+
+# --- Gemini / LLM-Matching -------------------------------------------------
+gemini:
+  model: "gemini-2.5-flash"
+  temperature: 0.0                 # Deterministisch fuer reproduzierbare Matches
+  max_output_tokens: 1024
+  timeout_seconds: 30
+  max_retries: 4                   # Exponentielles Backoff bei 429/5xx
+  initial_backoff_seconds: 2.0
+  max_backoff_seconds: 60.0
+  requests_per_minute: 60          # Client-seitiges Rate-Limiting
+  min_confidence: 0.80             # Ab hier gilt ein Match als belastbar
+  thinking_budget: 0               # 0 = aus (schneller/guenstiger bei 2.5-flash)
+
+# --- Datenquellen ----------------------------------------------------------
+sources:
+  # Aktuell implementiert: "csv" (Offline-/Testbetrieb) und "mock".
+  # Echte Marktplatz-Connectoren werden in sources/ ergaenzt.
+  provider: "csv"
+  csv:
+    offers_path: "data/offers.csv"
+  http:
+    timeout_seconds: 20
+    max_retries: 3
+    user_agent: "ArbitrageScout/1.0 (+headless)"
+
+# --- Suchraum --------------------------------------------------------------
+search:
+  max_candidates_per_run: 200      # Harte Obergrenze je Lauf (Kostenkontrolle)
+  # Strenge des kostenlosen Vorfilters vor dem LLM-Aufruf.
+  # 0.0 = nur sichere Verlustgeschaefte verwerfen, 1.0 = volle Schwellen anlegen.
+  prefilter_margin_factor: 0.5
+  categories:
+    - name: "haushalt"
+      keywords:
+        - "Wasserfilter Kartusche"
+        - "Vakuumierer Folienrollen"
+      max_purchase_price_eur: 60.0
+    - name: "kfz"
+      keywords:
+        - "OBD2 Diagnosegeraet"
+        - "Scheibenwischer Set"
+      max_purchase_price_eur: 80.0
+    - name: "elektronik-zubehoer"
+      keywords:
+        - "USB-C Hub 8 in 1"
+        - "Powerbank 20000mAh"
+      max_purchase_price_eur: 100.0
+
+# --- Ausgabe ---------------------------------------------------------------
+output:
+  results_dir: "data"
+  write_csv: true
+  write_json: true
+  # Nur Treffer mit Kaufempfehlung exportieren
+  only_recommended: false
+
+# --- Logging ---------------------------------------------------------------
+logging:
+  level: "INFO"                    # DEBUG | INFO | WARNING | ERROR
+  dir: "logs"
+  filename: "scout.log"
+  max_bytes: 5242880               # 5 MB je Datei
+  backup_count: 5
+  console: true
+  json_format: false               # true = strukturierte Logs fuer Loki/ELK

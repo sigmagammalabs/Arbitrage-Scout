@@ -1,0 +1,7 @@
+# Laufzeitabhaengigkeiten. Installation:
+#   python -m venv .venv && . .venv/bin/activate && pip install -r requirements.txt
+
+google-genai>=1.20.0,<3.0.0     # offizielles Gemini SDK (from google import genai)
+pydantic>=2.7,<3.0
+pydantic-settings>=2.3,<3.0
+PyYAML>=6.0,<7.0
