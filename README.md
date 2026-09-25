@@ -128,10 +128,18 @@ clientseitiges Rate-Limiting (`gemini.requests_per_minute`).
 
 ## Betrieb auf dem VPS
 
-`deploy/vps_setup.sh` richtet den Server ein — Systempakete, Service-Benutzer,
-getrennte venvs für diesen Scout und den Pre-Market Screener, Verzeichnisse,
-Rechte, optional Cron und logrotate. Das Skript ist idempotent und der übliche
-Weg, nach einem Update die Abhängigkeiten nachzuziehen.
+`deploy/vps_setup.sh` richtet den Server für **beide** Dienste ein —
+Systempakete, Service-Benutzer, je ein eigenes venv, Verzeichnisse, Rechte,
+optional Cron, systemd-Listener und logrotate. Das Skript ist idempotent und der
+übliche Weg, nach einem Update die Abhängigkeiten nachzuziehen.
+
+| | Repository | Zeitplan |
+|---|---|---|
+| Arbitrage Scout | [Arbitrage-Scout](https://github.com/sigmagammalabs/Arbitrage-Scout) | täglich 06:15 Europe/Berlin |
+| Pre-Market Screener | [Stock-Pre-Market-Screener](https://github.com/sigmagammalabs/Stock-Pre-Market-Screener) | Mo–Fr 08:15 Europe/Berlin |
+
+Beide URLs sind als Default hinterlegt; ohne weitere Angabe klont das Skript
+sie selbst.
 
 ### Installation aus diesem Repository
 
@@ -141,13 +149,36 @@ Das Repository ist oeffentlich, der VPS braucht also keine Zugangsdaten:
 REPO=https://github.com/sigmagammalabs/Arbitrage-Scout.git
 
 git clone "$REPO" /tmp/scout-bootstrap
-sudo bash /tmp/scout-bootstrap/deploy/vps_setup.sh --scout-repo "$REPO" --dry-run
-sudo bash /tmp/scout-bootstrap/deploy/vps_setup.sh --scout-repo "$REPO" --with-cron
+sudo bash /tmp/scout-bootstrap/deploy/vps_setup.sh --dry-run
+sudo bash /tmp/scout-bootstrap/deploy/vps_setup.sh --all
 ```
 
-Das Skript klont den Code nach `/opt/trading/arbitrage-scout/`, legt beide venvs
-an und installiert die Abhängigkeiten. `bash vps_setup.sh --help` listet alle
-Optionen.
+`--all` entspricht `--with-cron --with-listener`. Das Skript klont beide Projekte
+nach `/opt/trading/`, legt je ein venv an und installiert die Abhängigkeiten.
+`bash vps_setup.sh --help` listet alle Optionen.
+
+### Zusammenspiel mit dem Screener
+
+Der Screener bringt seine eigene Deployment-Kette mit (`deploy/setup_vps.sh`,
+`install_cron.sh`, `install_listener_service.sh`). `vps_setup.sh` baut die nicht
+nach, sondern übernimmt nur den gemeinsamen Unterbau und delegiert den Rest:
+
+- **Cron** ruft `deploy/run_scan.sh` des Screeners auf, nicht `main.py` direkt.
+  Der Wrapper setzt Universe, CSV-Export, Telegram-Versand und KI-Briefing — die
+  Aufrufsyntax bleibt damit im Screener-Repo und veraltet hier nicht.
+- **Telegram-Listener** wird aus der projekteigenen Unit-Vorlage
+  `watchlist-listener.service.template` erzeugt. Einziger Unterschied zum
+  mitgelieferten Installer: der setzt `User=$(whoami)`, hier wird der gemeinsame
+  Service-Benutzer eingetragen. Ohne gefüllten `TELEGRAM_BOT_TOKEN` wird der
+  Dienst aktiviert, aber nicht gestartet — sonst liefe er in eine Neustartschleife.
+- **Exec-Bits** der `deploy/*.sh` werden nach dem Clone gesetzt. Im Repo sind sie
+  als `100644` abgelegt; ohne `chmod +x` scheitert der Cron-Eintrag an
+  „Permission denied".
+
+Wer nur den Screener allein betreiben will, nutzt weiterhin dessen eigene
+Skripte — beide Wege schließen sich nicht aus, sollten aber nicht gemischt
+werden: der projekteigene `install_cron.sh` schreibt in die User-crontab,
+`vps_setup.sh` nach `/etc/cron.d`.
 
 Danach den API-Key eintragen — je nach `llm.provider` `GEMINI_API_KEY` oder
 `GROQ_API_KEY`:
@@ -184,9 +215,13 @@ Key ist die bessere Wahl.
 ### Updates
 
 ```bash
-cd /opt/trading/arbitrage-scout && sudo -u trader git pull
-sudo bash /tmp/scout-bootstrap/deploy/vps_setup.sh   # Abhängigkeiten nachziehen
+sudo bash /tmp/scout-bootstrap/deploy/vps_setup.sh   # zieht beide Repos nach
+sudo systemctl restart watchlist-listener            # nur bei Screener-Änderungen
 ```
+
+Das Skript macht den `git pull` selbst — und zwar als Service-Benutzer. Als root
+ausgeführt bräche Git mit „detected dubious ownership" ab, weil der Arbeitsbaum
+einem anderen Benutzer gehört.
 
 Der Cron-Eintrag, den es schreibt:
 

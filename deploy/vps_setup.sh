@@ -32,20 +32,37 @@ MIN_PY_MINOR=10                       # Projekte nutzen `X | None`-Syntax
 SCOUT_NAME="arbitrage-scout"
 SCREENER_NAME="premarket-screener"
 
-SCOUT_REPO="${SCOUT_REPO:-}"          # optional: git clone statt scp
-SCREENER_REPO="${SCREENER_REPO:-}"
+# Beide Repositories sind oeffentlich; ohne Angabe werden sie geklont.
+SCOUT_REPO="${SCOUT_REPO:-https://github.com/sigmagammalabs/Arbitrage-Scout.git}"
+SCREENER_REPO="${SCREENER_REPO:-https://github.com/sigmagammalabs/Stock-Pre-Market-Screener.git}"
 
-# Cron-Zeiten. Der Screener laeuft in New Yorker Zeit, damit ihn die
-# unterschiedlichen Sommerzeit-Umstellungen in EU und USA nicht zweimal im Jahr
-# um eine Stunde verschieben.
+# --- Arbitrage Scout ---
 SCOUT_CRON_TZ="${SCOUT_CRON_TZ:-Europe/Berlin}"
 SCOUT_CRON_TIME="${SCOUT_CRON_TIME:-15 6 * * *}"          # taeglich 06:15
-SCOUT_ENTRY="${SCOUT_ENTRY:-scout.py}"
-SCREENER_CRON_TZ="${SCREENER_CRON_TZ:-America/New_York}"
-SCREENER_CRON_TIME="${SCREENER_CRON_TIME:-45 8 * * 1-5}"  # Mo-Fr 08:45 ET
-SCREENER_ENTRY="${SCREENER_ENTRY:-screener.py}"
+SCOUT_ENTRY="${SCOUT_ENTRY:-scout.py}"                    # Existenzpruefung
+SCOUT_CRON_CMD="${SCOUT_CRON_CMD:-.venv/bin/python scout.py}"
+SCOUT_LOG="${SCOUT_LOG:-logs/cron.log}"
+
+# --- Pre-Market Screener ---
+# Der Screener bringt seinen eigenen Cron-Wrapper mit (deploy/run_scan.sh). Der
+# ruft `main.py scan` mit den passenden Argumenten auf -- ein selbst gebautes
+# `python main.py` waere ohne Unterbefehl schlicht falsch. Deshalb wird hier
+# delegiert statt nachgebaut.
+#
+# Zeitzone Europe/Berlin und 08:15: Das Projekt screent die EURO STOXX 50, nicht
+# US-Werte. Xetra oeffnet um 09:00 Berliner Zeit -- eine Umrechnung nach New York
+# waere hier schlicht das falsche Handelsgebiet.
+SCREENER_CRON_TZ="${SCREENER_CRON_TZ:-Europe/Berlin}"
+SCREENER_CRON_TIME="${SCREENER_CRON_TIME:-15 8 * * 1-5}"  # Mo-Fr 08:15, 45 Min vor Xetra
+SCREENER_ENTRY="${SCREENER_ENTRY:-main.py}"               # Existenzpruefung
+SCREENER_CRON_CMD="${SCREENER_CRON_CMD:-deploy/run_scan.sh}"
+SCREENER_LOG="${SCREENER_LOG:-watchlist/cron.log}"
+# Telegram-Listener als systemd-Dienst (Dauerbetrieb, nicht Cron).
+SCREENER_SERVICE_NAME="${SCREENER_SERVICE_NAME:-watchlist-listener}"
+SCREENER_SERVICE_TEMPLATE="deploy/watchlist-listener.service.template"
 
 WITH_CRON=0
+WITH_LISTENER=0
 WITH_LOGROTATE=1
 INSTALL_SYSTEM_PACKAGES=1
 DRY_RUN=0
@@ -93,6 +110,28 @@ run() {
     fi
 }
 
+# Fuehrt ein Kommando als Service-Benutzer aus.
+#
+# Noetig vor allem fuer git: Ein `git pull` als root auf einem Arbeitsbaum, der
+# einem anderen Benutzer gehoert, bricht mit "detected dubious ownership" ab --
+# und das trifft ausgerechnet den Update-Weg, fuer den dieses Skript gedacht ist.
+# runuser kommt aus util-linux und ist praktisch immer da; sudo fehlt auf
+# minimalen Images oefter.
+run_as_service_user() {
+    if (( ! IS_ROOT )) || [[ "$SERVICE_USER" == "root" ]]; then
+        run "$@"
+        return
+    fi
+    if command -v runuser >/dev/null 2>&1; then
+        run runuser -u "$SERVICE_USER" -- "$@"
+    elif command -v sudo >/dev/null 2>&1; then
+        run sudo -u "$SERVICE_USER" "$@"
+    else
+        warn "Weder runuser noch sudo vorhanden - laeuft als root: $*"
+        run "$@"
+    fi
+}
+
 # Schreibt eine Datei aus stdin. Im Dry-Run nur der Hinweis.
 write_file() {
     local path=$1 mode=${2:-644}
@@ -118,6 +157,8 @@ Optionen:
   --scout-repo URL       Arbitrage-Scout per git clone holen
   --screener-repo URL    Screener per git clone holen
   --with-cron            Cron-Eintraege unter /etc/cron.d anlegen
+  --with-listener        Telegram-Listener des Screeners als systemd-Dienst
+  --all                  Wie --with-cron --with-listener
   --no-logrotate         Keine logrotate-Regel schreiben
   --no-system-packages   apt-Installation ueberspringen
   --dry-run              Nur anzeigen, was passieren wuerde
@@ -136,6 +177,8 @@ while [[ $# -gt 0 ]]; do
         --scout-repo)    SCOUT_REPO=${2:?URL fehlt}; shift 2 ;;
         --screener-repo) SCREENER_REPO=${2:?URL fehlt}; shift 2 ;;
         --with-cron)     WITH_CRON=1; shift ;;
+        --with-listener) WITH_LISTENER=1; shift ;;
+        --all)           WITH_CRON=1; WITH_LISTENER=1; shift ;;
         --no-logrotate)  WITH_LOGROTATE=0; shift ;;
         --no-system-packages) INSTALL_SYSTEM_PACKAGES=0; shift ;;
         --dry-run)       DRY_RUN=1; shift ;;
@@ -209,7 +252,7 @@ install_system_packages() {
     fi
 
     log "Systempakete"
-    local packages=(python3-venv python3-pip git cron tzdata ca-certificates curl logrotate)
+    local packages=(python3-venv python3-pip git cron tzdata ca-certificates curl logrotate sudo)
     local missing=()
     for pkg in "${packages[@]}"; do
         dpkg-query -W -f='${Status}' "$pkg" 2>/dev/null | grep -q "ok installed" || missing+=("$pkg")
@@ -268,7 +311,7 @@ setup_project() {
     if [[ -n "$repo" ]]; then
         if [[ -d "$dir/.git" ]]; then
             step "Repository aktualisieren"
-            run git -C "$dir" pull --ff-only
+            run_as_service_user git -C "$dir" pull --ff-only
         else
             step "Repository klonen"
             # In ein bestehendes, nicht leeres Verzeichnis klonen: Umweg ueber
@@ -332,6 +375,13 @@ REQ
         warn "[$label] Keine requirements.txt - Vorlage angelegt, es wurde nichts installiert."
     fi
 
+    # --- mitgelieferte Skripte ausfuehrbar machen ---
+    # Nach einem Clone kann das Exec-Bit fehlen; der Cron-Wrapper des Screeners
+    # laeuft sonst nicht.
+    if [[ -d "$dir/deploy" ]] && (( ! DRY_RUN )); then
+        chmod +x "$dir"/deploy/*.sh 2>/dev/null || true
+    fi
+
     # --- .env ---
     if [[ -f "$dir/.env" ]]; then
         ok "  .env vorhanden"
@@ -363,9 +413,9 @@ ENVTPL
 # Cron
 # ---------------------------------------------------------------------------
 cron_line() {
-    local schedule=$1 dir=$2 entry=$3
-    printf '%s %s cd %s && .venv/bin/python %s >> logs/cron.log 2>&1\n' \
-        "$schedule" "$SERVICE_USER" "$dir" "$entry"
+    local schedule=$1 dir=$2 command=$3 logfile=$4
+    printf '%s %s cd %s && %s >> %s 2>&1\n' \
+        "$schedule" "$SERVICE_USER" "$dir" "$command" "$logfile"
 }
 
 install_cron() {
@@ -386,21 +436,78 @@ SHELL=/bin/bash
 PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 MAILTO=""
 CRON_TZ=$SCOUT_CRON_TZ
-$(cron_line "$SCOUT_CRON_TIME" "$BASE_DIR/$SCOUT_NAME" "$SCOUT_ENTRY")
+$(cron_line "$SCOUT_CRON_TIME" "$BASE_DIR/$SCOUT_NAME" "$SCOUT_CRON_CMD" "$SCOUT_LOG")
 CRONSCOUT
 
     write_file /etc/cron.d/premarket-screener 644 <<CRONSCREENER
 # Pre-Market Screener -- von vps_setup.sh erzeugt
-# Zeitzone bewusst America/New_York: so bleibt der Abstand zur US-Eroeffnung
-# konstant, auch wenn EU und USA die Sommerzeit an verschiedenen Tagen umstellen.
+# Aufgerufen wird der Wrapper des Projekts (deploy/run_scan.sh), nicht direkt
+# main.py: der Wrapper setzt Universe, Export, Telegram-Versand und KI-Briefing.
+# Damit bleibt die Aufrufsyntax im Screener-Repo und veraltet hier nicht.
 SHELL=/bin/bash
 PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 MAILTO=""
 CRON_TZ=$SCREENER_CRON_TZ
-$(cron_line "$SCREENER_CRON_TIME" "$BASE_DIR/$SCREENER_NAME" "$SCREENER_ENTRY")
+$(cron_line "$SCREENER_CRON_TIME" "$BASE_DIR/$SCREENER_NAME" "$SCREENER_CRON_CMD" "$SCREENER_LOG")
 CRONSCREENER
 
     ok "Cron-Dateien geschrieben"
+}
+
+
+# ---------------------------------------------------------------------------
+# systemd: Telegram-Listener des Screeners
+# ---------------------------------------------------------------------------
+install_listener_service() {
+    if (( ! WITH_LISTENER )); then
+        skip "Telegram-Listener uebersprungen (--with-listener aktiviert ihn)"
+        return
+    fi
+    if (( ! IS_ROOT )); then
+        warn "--with-listener braucht root - Dienst wurde nicht eingerichtet."
+        return
+    fi
+    if ! command -v systemctl >/dev/null 2>&1; then
+        warn "Kein systemd gefunden - Telegram-Listener wurde nicht eingerichtet."
+        return
+    fi
+
+    local dir="$BASE_DIR/$SCREENER_NAME"
+    local template="$dir/$SCREENER_SERVICE_TEMPLATE"
+    local unit="/etc/systemd/system/${SCREENER_SERVICE_NAME}.service"
+
+    if [[ ! -f "$template" ]]; then
+        warn "Vorlage $template fehlt - Telegram-Listener uebersprungen."
+        return
+    fi
+
+    log "systemd-Dienst $SCREENER_SERVICE_NAME"
+
+    # Die Vorlage bleibt die einzige Quelle der Wahrheit; hier werden nur die
+    # beiden Platzhalter ersetzt. Der Unterschied zum projekteigenen Installer:
+    # der setzt User=$(whoami), wir tragen den Service-Benutzer ein.
+    if (( DRY_RUN )); then
+        printf '%s  would write:%s %s (User=%s, WorkingDirectory=%s)\n' \
+            "$C_DIM" "$C_RESET" "$unit" "$SERVICE_USER" "$dir"
+    else
+        sed -e "s#__VPS_USER__#${SERVICE_USER}#g" \
+            -e "s#__PROJECT_DIR__#${dir}#g" \
+            "$template" > "$unit"
+        chmod 644 "$unit"
+    fi
+
+    run systemctl daemon-reload
+    run systemctl enable "${SCREENER_SERVICE_NAME}.service"
+
+    # Ohne befuellte .env startet der Listener sofort wieder durch. Lieber
+    # aktiviert lassen und den Start dem Benutzer ueberlassen.
+    if (( ! DRY_RUN )) && grep -qE '^TELEGRAM_BOT_TOKEN=.+' "$dir/.env" 2>/dev/null; then
+        run systemctl restart "${SCREENER_SERVICE_NAME}.service"
+        ok "Dienst laeuft (Status: systemctl status $SCREENER_SERVICE_NAME)"
+    else
+        warn "TELEGRAM_BOT_TOKEN in $dir/.env noch leer - Dienst ist aktiviert, "\
+"aber nicht gestartet. Nach dem Eintragen: systemctl start $SCREENER_SERVICE_NAME"
+    fi
 }
 
 # ---------------------------------------------------------------------------
@@ -418,7 +525,7 @@ install_logrotate() {
     # Schreibt der Screener eigene Logdateien ohne eigene Rotation, gehoeren
     # deren Namen hier ergaenzt.
     write_file /etc/logrotate.d/trading 644 <<ROTATE
-$BASE_DIR/*/logs/cron.log {
+$BASE_DIR/*/logs/cron.log $BASE_DIR/*/watchlist/cron.log {
     weekly
     rotate 8
     compress
@@ -484,21 +591,28 @@ summary() {
   Naechste Schritte:
 
     1. Secrets eintragen
-         sudoedit $BASE_DIR/$SCOUT_NAME/.env         # GEMINI_API_KEY
+         sudoedit $BASE_DIR/$SCOUT_NAME/.env
+           GEMINI_API_KEY oder GROQ_API_KEY, je nach llm.provider
          sudoedit $BASE_DIR/$SCREENER_NAME/.env
+           TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, GROQ_API_KEY
 
-    2. Testlauf ohne Nebenwirkungen
+    2. Testlauf, beide ohne Nebenwirkungen
          sudo -u $SERVICE_USER env -C $BASE_DIR/$SCOUT_NAME \\
               .venv/bin/python scout.py --dry-run
-
-    3. Abhaengigkeiten des Screeners in dessen requirements.txt eintragen
-       und dieses Skript erneut ausfuehren.
+         sudo -u $SERVICE_USER env -C $BASE_DIR/$SCREENER_NAME \\
+              .venv/bin/python main.py scan --universe custom \\
+              --tickers SAP.DE,SIE.DE --min-gap-pct 0.1
 
   Betrieb:
 
-    Logs        tail -f $BASE_DIR/*/logs/*.log
-    Cron-Status systemctl status cron
-    Update      cd $BASE_DIR/<dienst> && git pull && bash $(basename "$0")
+    Logs Scout     tail -f $BASE_DIR/$SCOUT_NAME/logs/*.log
+    Logs Screener  tail -f $BASE_DIR/$SCREENER_NAME/watchlist/*.log
+    Listener       systemctl status $SCREENER_SERVICE_NAME
+                   journalctl -u $SCREENER_SERVICE_NAME -f
+    Cron-Status    systemctl status cron
+    Update         cd $BASE_DIR/<dienst> && sudo -u $SERVICE_USER git pull
+                   dann dieses Skript erneut ausfuehren
+                   (Listener danach: systemctl restart $SCREENER_SERVICE_NAME)
 NEXT
 
     if (( WITH_CRON && ! IS_ROOT )); then
@@ -508,11 +622,11 @@ NEXT
 
     # /etc/cron.d/arbitrage-scout
     CRON_TZ=$SCOUT_CRON_TZ
-    $(cron_line "$SCOUT_CRON_TIME" "$BASE_DIR/$SCOUT_NAME" "$SCOUT_ENTRY")
+    $(cron_line "$SCOUT_CRON_TIME" "$BASE_DIR/$SCOUT_NAME" "$SCOUT_CRON_CMD" "$SCOUT_LOG")
 
     # /etc/cron.d/premarket-screener
     CRON_TZ=$SCREENER_CRON_TZ
-    $(cron_line "$SCREENER_CRON_TIME" "$BASE_DIR/$SCREENER_NAME" "$SCREENER_ENTRY")
+    $(cron_line "$SCREENER_CRON_TIME" "$BASE_DIR/$SCREENER_NAME" "$SCREENER_CRON_CMD" "$SCREENER_LOG")
 CRONHINT
     elif (( WITH_CRON )); then
         printf '\n  Cron aktiv:\n    %-22s %s %s\n    %-22s %s %s\n' \
@@ -539,6 +653,7 @@ main() {
     setup_project "$SCREENER_NAME" "Pre-Market Screener"     "$SCREENER_REPO" "$SCREENER_ENTRY"
 
     install_cron
+    install_listener_service
     install_logrotate
     verify
     summary
