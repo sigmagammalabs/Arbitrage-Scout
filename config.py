@@ -111,7 +111,10 @@ class ProviderConfig(BaseModel):
 
 
 class GeminiConfig(ProviderConfig):
-    model: str = "gemini-2.5-flash"
+    # Google zieht Modellversionen regelmaessig fuer Neukunden zurueck (zuletzt
+    # 2.5-flash: HTTP 404 statt eines Retry-faehigen Fehlers). Aktuellen Stand
+    # pruefen: https://ai.google.dev/gemini-api/docs/models
+    model: str = "gemini-3.8-flash"
     # 0 schaltet das interne "Nachdenken" ab -- schneller und guenstiger. Der
     # Produktabgleich ist eine Klassifikation, keine Herleitung.
     thinking_budget: int = Field(0, ge=0)
