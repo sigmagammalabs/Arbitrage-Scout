@@ -49,6 +49,7 @@ from matcher import (
 )
 from logging_utils import RUN_ID, get_logger, setup_logging
 from models import CandidatePair
+from notify import send_run_summary
 from sources import OfferSource, SourceError, build_source, write_example_csv
 
 logger = get_logger(__name__)
@@ -529,6 +530,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--no-export", action="store_true", help="Ergebnisse nicht auf die Platte schreiben."
     )
+    parser.add_argument(
+        "--notify-telegram",
+        action="store_true",
+        help="Zusammenfassung nach Lauf-Ende an TELEGRAM_CHAT_ID senden (auch bei 0 Treffern).",
+    )
     parser.add_argument("--no-lock", action="store_true", help="Ohne Lockfile laufen.")
     parser.add_argument(
         "--log-level",
@@ -592,6 +598,8 @@ def main(argv: list[str] | None = None) -> int:
         print(f"GROQ_API_KEY:   {'gesetzt' if settings.secrets.has_groq_key else 'fehlt'}")
         if not settings.secrets.has_key(provider):
             print(f"  ! Kein Key fuer '{provider}' - Laeufe fallen auf die Heuristik zurueck.")
+        telegram_state = "gesetzt" if settings.secrets.has_telegram else "fehlt (optional)"
+        print(f"Telegram:       {telegram_state} (fuer --notify-telegram und listener.py)")
         print(f"Schwellen:      ROI >= {cfg.margin.min_roi_percent} %, "
               f"Gewinn >= {cfg.margin.min_profit_eur} EUR")
         print(f"Kategorien:     {', '.join(c.name for c in cfg.search.categories) or 'keine'}")
@@ -650,6 +658,12 @@ def _execute(settings: Settings, args: argparse.Namespace) -> int:
         export_results(settings, results)
     elif args.dry_run:
         logger.info("Dry-Run: Export uebersprungen.")
+
+    if args.notify_telegram:
+        sent = send_run_summary(
+            settings, results, scout.stats, run_id=RUN_ID, offline=scout.matcher.offline
+        )
+        logger.info("Telegram-Benachrichtigung %s.", "gesendet" if sent else "nicht gesendet")
 
     if not args.quiet:
         print_report(results, verbose=args.verbose)

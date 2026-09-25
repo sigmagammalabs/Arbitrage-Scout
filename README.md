@@ -23,6 +23,8 @@ bleibt deterministisch in `calculator.py`.
 | `sources.py` | Woher die Angebote kommen (CSV / Mock; erweiterbar um echte APIs). |
 | `scout.py` | Orchestrator mit CLI. |
 | `logging_utils.py` | Rotierende Logs, Secret-Redaction, Lauf-ID. |
+| `notify.py` | Telegram-Versand und Nachrichtenformatierung. |
+| `listener.py` | Telegram-Bot: `/scan`, `/stop`, `/status` per Chat. |
 
 Konfigurations-Priorität, absteigend: CLI-Flag → Umgebungsvariable → `.env` → `config.yaml`.
 
@@ -64,6 +66,7 @@ oder `GROQ_API_KEY`.
 --min-profit EUR       Mindestgewinn überschreiben
 --provider NAME        LLM-Backend für diesen Lauf (gemini | groq)
 --offline              Heuristik statt LLM, Export bleibt aktiv
+--notify-telegram      Zusammenfassung nach Lauf-Ende an Telegram senden
 --no-prefilter         Jedes Paar ans LLM schicken (teurer, vollständiger)
 --no-export            Nicht auf die Platte schreiben
 --no-lock              Ohne Lockfile laufen
@@ -285,6 +288,49 @@ deren Nutzungsbedingungen. Vorgesehener Weg sind die offiziellen APIs
 (eBay Browse API, Amazon PA-API) oder ein lizenzierter Datenanbieter; die
 Zugangsdaten dafür sind in `.env.example` bereits vorgesehen.
 
+## Telegram
+
+Zwei unabhängige Bausteine, beide optional — ohne `TELEGRAM_BOT_TOKEN` und
+`TELEGRAM_CHAT_ID` in `.env` bleibt alles wie zuvor, nichts bricht.
+
+**Benachrichtigung nach jedem Lauf** (`notify.py`): `scout.py --notify-telegram`
+sendet nach Abschluss eine Zusammenfassung — Empfehlungen mit Preisen, Gewinn,
+ROI, dazu die Laufstatistik. Läuft standardmäßig auch bei 0 Empfehlungen
+(`telegram.notify_on_empty`), damit Stille nicht zweideutig ist ("nichts
+gefunden" vs. "Cron ist kaputt"). Der von `vps_setup.sh` erzeugte Cron-Eintrag
+setzt das Flag automatisch.
+
+**Start/Stop per Chat** (`listener.py`): Long-Polling-Bot, läuft dauerhaft als
+systemd-Dienst, getrennt vom Cronjob.
+
+```
+/scan, /run   Lauf sofort starten (--notify-telegram, --quiet)
+/stop         Aktiven Lauf abbrechen — egal ob per Chat oder per Cron gestartet
+/status       Läuft gerade etwas?
+/start, /help Kurzübersicht
+```
+
+`/start` löst bewusst **keinen** Scan aus — Telegram sendet diesen Befehl
+automatisch, sobald jemand den Chat öffnet; würde er einen Lauf starten,
+kostete schon das Öffnen des Chats eine LLM-Anfrage. `/stop` wirkt auch auf
+einen per Cron gestarteten Lauf: Der Listener erkennt ihn über dasselbe
+PID-Lockfile (`logs/scout.lock`), das `scout.py` ohnehin gegen überlappende
+Läufe nutzt, und schickt `SIGTERM` — Scout beendet sich dann geordnet nach dem
+aktuellen Paar, reagiert er 60 s lang nicht, eskaliert der Listener auf
+`SIGKILL`.
+
+**Sicherheit:** Nur Nachrichten von der konfigurierten `TELEGRAM_CHAT_ID`
+werden verarbeitet, jede andere wird geloggt und ohne Antwort verworfen —
+sonst könnte jeder, der die Bot-ID errät, kostenpflichtige Läufe auslösen.
+
+Auf dem VPS richtet `vps_setup.sh --with-listener` (Teil von `--all`) den
+Dienst automatisch ein (`arbitrage-scout-listener.service`):
+
+```bash
+systemctl status arbitrage-scout-listener
+journalctl -u arbitrage-scout-listener -f
+```
+
 ## Tests
 
 ```bash
@@ -292,10 +338,13 @@ pip install -r requirements-dev.txt
 python -m pytest tests -q
 ```
 
-57 Tests, ohne Netzwerk. Der Online-Pfad wird mit eingeschleusten
+108 Tests, ohne Netzwerk. Der LLM-Online-Pfad wird mit eingeschleusten
 Fake-Providern geprüft: Retry bei 429/5xx, Abbruch nach `max_retries`, kein
 Retry bei fachlichen Fehlern, Weiterlaufen nach Einzelfehlern, und für Groq der
-Rückfall von `json_schema` auf den JSON-Modus.
+Rückfall von `json_schema` auf den JSON-Modus. Der Listener wird mit einem
+Fake-Subprozess getestet (kein echter `scout.py`-Aufruf), `os.kill` wird
+gemockt statt auf echtes Prozess-Verhalten zu vertrauen — das unterscheidet
+sich nachweislich zwischen Windows und Linux, dem tatsächlichen Zielsystem.
 
 ## Haftungsausschluss
 

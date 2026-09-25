@@ -126,3 +126,10 @@ logging:
   backup_count: 5
   console: true
   json_format: false               # true = strukturierte Logs fuer Loki/ELK
+
+# --- Telegram (optional) -----------------------------------------------------
+# Zugangsdaten (TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID) stehen in .env, nicht hier.
+telegram:
+  long_poll_seconds: 20.0          # Long-Poll-Timeout gegen getUpdates (listener.py)
+  notify_on_empty: true            # Auch senden, wenn 0 Empfehlungen (Herzschlag)
+  max_recommendations_in_message: 10

@@ -40,8 +40,13 @@ SCREENER_REPO="${SCREENER_REPO:-https://github.com/sigmagammalabs/Stock-Pre-Mark
 SCOUT_CRON_TZ="${SCOUT_CRON_TZ:-Europe/Berlin}"
 SCOUT_CRON_TIME="${SCOUT_CRON_TIME:-15 6 * * *}"          # taeglich 06:15
 SCOUT_ENTRY="${SCOUT_ENTRY:-scout.py}"                    # Existenzpruefung
-SCOUT_CRON_CMD="${SCOUT_CRON_CMD:-.venv/bin/python scout.py}"
+SCOUT_CRON_CMD="${SCOUT_CRON_CMD:-.venv/bin/python scout.py --notify-telegram}"
 SCOUT_LOG="${SCOUT_LOG:-logs/cron.log}"
+# Telegram-Listener des Scouts (Start/Stop-Befehle, siehe listener.py). Ohne
+# TELEGRAM_BOT_TOKEN in .env bleibt --notify-telegram im Cron wirkungslos
+# (send_message loggt und gibt False zurueck, der Lauf bricht nicht ab).
+SCOUT_SERVICE_NAME="${SCOUT_SERVICE_NAME:-arbitrage-scout-listener}"
+SCOUT_SERVICE_TEMPLATE="deploy/scout-listener.service.template"
 
 # --- Pre-Market Screener ---
 # Der Screener bringt seinen eigenen Cron-Wrapper mit (deploy/run_scan.sh). Der
@@ -162,7 +167,7 @@ Optionen:
   --no-screener          Screener ueberspringen (z. B. wenn er bereits
                           anderswo laeuft und eigene deploy/*.sh nutzt)
   --with-cron            Cron-Eintraege unter /etc/cron.d anlegen
-  --with-listener        Telegram-Listener des Screeners als systemd-Dienst
+  --with-listener        Telegram-Listener als systemd-Dienst (je aktivem Dienst)
   --all                  Wie --with-cron --with-listener
   --no-logrotate         Keine logrotate-Regel schreiben
   --no-system-packages   apt-Installation ueberspringen
@@ -471,40 +476,26 @@ CRONSCREENER
 
 
 # ---------------------------------------------------------------------------
-# systemd: Telegram-Listener des Screeners
+# systemd: Telegram-Listener (Scout und Screener, je nach --no-scout/--no-screener)
 # ---------------------------------------------------------------------------
-install_listener_service() {
-    if (( ! SETUP_SCREENER )); then
-        skip "Telegram-Listener uebersprungen (--no-screener)"
-        return
-    fi
-    if (( ! WITH_LISTENER )); then
-        skip "Telegram-Listener uebersprungen (--with-listener aktiviert ihn)"
-        return
-    fi
-    if (( ! IS_ROOT )); then
-        warn "--with-listener braucht root - Dienst wurde nicht eingerichtet."
-        return
-    fi
-    if ! command -v systemctl >/dev/null 2>&1; then
-        warn "Kein systemd gefunden - Telegram-Listener wurde nicht eingerichtet."
-        return
-    fi
-
-    local dir="$BASE_DIR/$SCREENER_NAME"
-    local template="$dir/$SCREENER_SERVICE_TEMPLATE"
-    local unit="/etc/systemd/system/${SCREENER_SERVICE_NAME}.service"
+# Richtet einen einzelnen systemd-Listener-Dienst aus der Vorlage des
+# jeweiligen Projekts ein. <projektname> nur fuer Log-/Warnmeldungen.
+_install_one_listener(){
+    local label=$1 dir=$2 template_rel=$3 service_name=$4
+    local template="$dir/$template_rel"
+    local unit="/etc/systemd/system/${service_name}.service"
 
     if [[ ! -f "$template" ]]; then
-        warn "Vorlage $template fehlt - Telegram-Listener uebersprungen."
+        warn "[$label] Vorlage $template fehlt - Telegram-Listener uebersprungen."
         return
     fi
 
-    log "systemd-Dienst $SCREENER_SERVICE_NAME"
+    log "systemd-Dienst $service_name ($label)"
 
     # Die Vorlage bleibt die einzige Quelle der Wahrheit; hier werden nur die
-    # beiden Platzhalter ersetzt. Der Unterschied zum projekteigenen Installer:
-    # der setzt User=$(whoami), wir tragen den Service-Benutzer ein.
+    # beiden Platzhalter ersetzt. Unterschied zu manuell installierten
+    # Vorlagen: die setzen oft User=$(whoami), wir tragen den gemeinsamen
+    # Service-Benutzer ein.
     if (( DRY_RUN )); then
         printf '%s  would write:%s %s (User=%s, WorkingDirectory=%s)\n' \
             "$C_DIM" "$C_RESET" "$unit" "$SERVICE_USER" "$dir"
@@ -516,16 +507,46 @@ install_listener_service() {
     fi
 
     run systemctl daemon-reload
-    run systemctl enable "${SCREENER_SERVICE_NAME}.service"
+    run systemctl enable "${service_name}.service"
 
-    # Ohne befuellte .env startet der Listener sofort wieder durch. Lieber
-    # aktiviert lassen und den Start dem Benutzer ueberlassen.
+    # Ohne befuellte .env startet der Listener sofort wieder durch (Restart=
+    # on-failure faengt das ab, aber sinnlos). Lieber aktiviert lassen und den
+    # ersten Start dem Benutzer ueberlassen, nachdem TELEGRAM_BOT_TOKEN steht.
     if (( ! DRY_RUN )) && grep -qE '^TELEGRAM_BOT_TOKEN=.+' "$dir/.env" 2>/dev/null; then
-        run systemctl restart "${SCREENER_SERVICE_NAME}.service"
-        ok "Dienst laeuft (Status: systemctl status $SCREENER_SERVICE_NAME)"
+        run systemctl restart "${service_name}.service"
+        ok "[$label] Dienst laeuft (Status: systemctl status $service_name)"
     else
-        warn "TELEGRAM_BOT_TOKEN in $dir/.env noch leer - Dienst ist aktiviert, "\
-"aber nicht gestartet. Nach dem Eintragen: systemctl start $SCREENER_SERVICE_NAME"
+        warn "[$label] TELEGRAM_BOT_TOKEN in $dir/.env noch leer - Dienst ist "\
+"aktiviert, aber nicht gestartet. Nach dem Eintragen: systemctl start $service_name"
+    fi
+}
+
+install_listener_service() {
+    if (( ! WITH_LISTENER )); then
+        skip "Telegram-Listener uebersprungen (--with-listener aktiviert ihn)"
+        return
+    fi
+    if (( ! IS_ROOT )); then
+        warn "--with-listener braucht root - Dienste wurden nicht eingerichtet."
+        return
+    fi
+    if ! command -v systemctl >/dev/null 2>&1; then
+        warn "Kein systemd gefunden - Telegram-Listener wurden nicht eingerichtet."
+        return
+    fi
+
+    if (( SETUP_SCOUT )); then
+        _install_one_listener "Arbitrage Scout" "$BASE_DIR/$SCOUT_NAME" \
+            "$SCOUT_SERVICE_TEMPLATE" "$SCOUT_SERVICE_NAME"
+    else
+        skip "Scout-Listener uebersprungen (--no-scout)"
+    fi
+
+    if (( SETUP_SCREENER )); then
+        _install_one_listener "Pre-Market Screener" "$BASE_DIR/$SCREENER_NAME" \
+            "$SCREENER_SERVICE_TEMPLATE" "$SCREENER_SERVICE_NAME"
+    else
+        skip "Screener-Listener uebersprungen (--no-screener)"
     fi
 }
 
@@ -635,14 +656,17 @@ summary() {
     fi
 
     printf '\n  Betrieb:\n\n'
-    (( SETUP_SCOUT ))    && printf '    Logs Scout     tail -f %s/%s/logs/*.log\n' "$BASE_DIR" "$SCOUT_NAME"
-    (( SETUP_SCREENER )) && printf '    Logs Screener  tail -f %s/%s/watchlist/*.log\n' "$BASE_DIR" "$SCREENER_NAME"
-    (( SETUP_SCREENER && WITH_LISTENER )) && printf '    Listener       systemctl status %s\n                   journalctl -u %s -f\n' \
+    (( SETUP_SCOUT ))    && printf '    Logs Scout       tail -f %s/%s/logs/*.log\n' "$BASE_DIR" "$SCOUT_NAME"
+    (( SETUP_SCREENER )) && printf '    Logs Screener    tail -f %s/%s/watchlist/*.log\n' "$BASE_DIR" "$SCREENER_NAME"
+    (( SETUP_SCOUT && WITH_LISTENER )) && printf '    Scout-Listener   systemctl status %s\n                     journalctl -u %s -f\n' \
+        "$SCOUT_SERVICE_NAME" "$SCOUT_SERVICE_NAME"
+    (( SETUP_SCREENER && WITH_LISTENER )) && printf '    Screener-Listener systemctl status %s\n                     journalctl -u %s -f\n' \
         "$SCREENER_SERVICE_NAME" "$SCREENER_SERVICE_NAME"
-    (( WITH_CRON )) && printf '    Cron-Status    systemctl status cron\n'
-    printf '    Update         cd %s/<dienst> && sudo -u %s git pull\n' "$BASE_DIR" "$SERVICE_USER"
-    printf '                   dann dieses Skript erneut ausfuehren\n'
-    (( SETUP_SCREENER && WITH_LISTENER )) && printf '                   (Listener danach: systemctl restart %s)\n' "$SCREENER_SERVICE_NAME"
+    (( WITH_CRON )) && printf '    Cron-Status      systemctl status cron\n'
+    printf '    Update           cd %s/<dienst> && sudo -u %s git pull\n' "$BASE_DIR" "$SERVICE_USER"
+    printf '                     dann dieses Skript erneut ausfuehren\n'
+    (( SETUP_SCOUT && WITH_LISTENER )) && printf '                     (Scout-Listener danach: systemctl restart %s)\n' "$SCOUT_SERVICE_NAME"
+    (( SETUP_SCREENER && WITH_LISTENER )) && printf '                     (Screener-Listener danach: systemctl restart %s)\n' "$SCREENER_SERVICE_NAME"
 
     if (( WITH_CRON && ! IS_ROOT )); then
         printf '\n  Cron braucht root. Diese Zeilen als root in /etc/cron.d ablegen:\n\n'

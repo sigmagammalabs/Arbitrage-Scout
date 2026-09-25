@@ -8,3 +8,4 @@ groq>=0.11.0,<2.0.0             # Groq    (OpenAI-kompatible Chat-API)
 pydantic>=2.7,<3.0
 pydantic-settings>=2.3,<3.0
 PyYAML>=6.0,<7.0
+requests>=2.31,<3.0             # Telegram-Versand/-Listener (notify.py, listener.py)

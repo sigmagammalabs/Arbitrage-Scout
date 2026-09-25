@@ -1,0 +1,21 @@
+[Unit]
+Description=Arbitrage Scout Telegram Listener
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=__VPS_USER__
+WorkingDirectory=__PROJECT_DIR__
+ExecStart=__PROJECT_DIR__/.venv/bin/python listener.py
+Restart=on-failure
+RestartSec=10
+EnvironmentFile=__PROJECT_DIR__/.env
+
+# Haertung
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+
+[Install]
+WantedBy=multi-user.target

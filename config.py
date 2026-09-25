@@ -223,6 +223,21 @@ class LoggingConfig(BaseModel):
         return v.upper() if isinstance(v, str) else v
 
 
+class TelegramConfig(BaseModel):
+    """Einstellungen fuer Benachrichtigung (``scout.py --notify-telegram``) und
+    den optionalen Listener (``listener.py``). Zugangsdaten stehen in
+    ``Secrets``, nicht hier."""
+
+    # Long-Poll-Timeout gegen die Telegram getUpdates-API. Hoeher = weniger
+    # Requests, aber traegere Reaktion auf /stop. 20s ist Telegrams eigene
+    # Empfehlung fuer Long-Polling.
+    long_poll_seconds: float = Field(20.0, gt=0.0, le=50.0)
+    # Auch senden, wenn 0 Empfehlungen gefunden wurden -- dient als Herzschlag:
+    # Stille kann sonst "nichts gefunden" oder "Cron ist kaputt" bedeuten.
+    notify_on_empty: bool = True
+    max_recommendations_in_message: int = Field(10, gt=0, le=50)
+
+
 # ---------------------------------------------------------------------------
 # Secrets aus .env / Umgebung
 # ---------------------------------------------------------------------------
@@ -293,6 +308,27 @@ class Secrets(BaseSettings):
     def require_groq_key(self) -> str:
         return self.require_key("groq")
 
+    @property
+    def has_telegram(self) -> bool:
+        """Beide Werte muessen gesetzt sein -- ein Bot-Token ohne Chat-ID kann
+        nirgendwo hinsenden, eine Chat-ID ohne Token authentifiziert sich nicht."""
+        token_set = bool(
+            self.telegram_bot_token and self.telegram_bot_token.get_secret_value().strip()
+        )
+        chat_set = bool(self.telegram_chat_id and self.telegram_chat_id.strip())
+        return token_set and chat_set
+
+    def require_telegram(self) -> tuple[str, str]:
+        """(bot_token, chat_id) im Klartext -- nur unmittelbar vor dem API-Aufruf verwenden."""
+        if not self.has_telegram:
+            raise ConfigError(
+                "TELEGRAM_BOT_TOKEN und TELEGRAM_CHAT_ID muessen beide gesetzt sein "
+                "(.env oder Umgebungsvariable)."
+            )
+        assert self.telegram_bot_token is not None
+        assert self.telegram_chat_id is not None
+        return self.telegram_bot_token.get_secret_value().strip(), self.telegram_chat_id.strip()
+
 
 # ---------------------------------------------------------------------------
 # Gesamtkonfiguration
@@ -360,6 +396,7 @@ class AppConfig(BaseSettings):
     search: SearchConfig = Field(default_factory=SearchConfig)
     output: OutputConfig = Field(default_factory=OutputConfig)
     logging: LoggingConfig = Field(default_factory=LoggingConfig)
+    telegram: TelegramConfig = Field(default_factory=TelegramConfig)
 
 
 class Settings(BaseModel):
