@@ -38,10 +38,17 @@ cp data/offers.example.csv data/offers.csv
 python scout.py --dry-run
 ```
 
-`--dry-run` ruft die API nicht auf und schreibt nichts auf die Platte. Ohne
-API-Key fällt der Matcher automatisch auf eine Titel-Heuristik zurück — die
-reicht, um die Pipeline zu prüfen, aber ausdrücklich **nicht** für echte
-Kaufentscheidungen.
+`--dry-run` ruft die API nicht auf und schreibt nichts auf die Platte —
+**erzwungen**, unabhängig davon, ob ein API-Key gesetzt ist: der Matcher läuft
+dabei immer im Heuristik-Modus (Titelvergleich statt LLM). Das reicht, um die
+Pipeline zu prüfen, aber ausdrücklich **nicht** für echte Kaufentscheidungen.
+
+Um mit echtem API-Key wirklich zu matchen, ohne Ergebnisse zu exportieren, statt
+`--dry-run` also `--no-export` verwenden:
+
+```bash
+python scout.py --no-export -v
+```
 
 In `.env` genügt der Key des Backends, das du verwendest: `GEMINI_API_KEY`
 oder `GROQ_API_KEY`.
@@ -108,10 +115,11 @@ Optional zuschaltbar in `config.yaml`, standardmäßig aus: Umsatzsteuer bei
 Regelbesteuerung, Vorsteuerabzug, Einfuhrzoll, Wareneingangsversand,
 separate Zahlungsgebühren.
 
-**Gebindenormierung:** Gemini liefert `package_quantity_source` und
-`package_quantity_target`. Wer ein 12er-Pack für 39,99 € kauft und ein 3er-Pack
-verkauft, trägt pro Verkauf nur 10,00 € Wareneinsatz. Ohne diese Normierung
-rechnet man sich systematisch arm — oder, in der Gegenrichtung, reich.
+**Gebindenormierung:** Das LLM liefert `package_quantity_source` und
+`package_quantity_target` — unabhängig davon, ob Gemini oder Groq antwortet.
+Wer ein 12er-Pack für 39,99 € kauft und ein 3er-Pack verkauft, trägt pro
+Verkauf nur 10,00 € Wareneinsatz. Ohne diese Normierung rechnet man sich
+systematisch arm — oder, in der Gegenrichtung, reich.
 
 Jedes Ergebnis enthält zusätzlich `break_even_price_eur` und
 `min_viable_sale_price_eur` — der Preis, ab dem der Artikel die konfigurierten
@@ -124,7 +132,9 @@ den Titeln geschätzt und die Marge überschlagen. Verworfen wird erst deutlich
 unterhalb der echten Schwellen (`search.prefilter_margin_factor`, Standard 0.5),
 damit Grenzfälle nicht ungeprüft verloren gehen. Dazu kommen ein Ergebnis-Cache
 pro Lauf, `search.max_candidates_per_run` als harte Obergrenze und
-clientseitiges Rate-Limiting (`gemini.requests_per_minute`).
+clientseitiges Rate-Limiting — je nach Provider `gemini.requests_per_minute`
+(Standard 60) oder `groq.requests_per_minute` (Standard 30, enger wegen des
+Groq-Free-Tiers).
 
 ## Betrieb auf dem VPS
 
@@ -232,11 +242,15 @@ Das Skript macht den `git pull` selbst — und zwar als Service-Benutzer. Als ro
 ausgeführt bräche Git mit „detected dubious ownership" ab, weil der Arbeitsbaum
 einem anderen Benutzer gehört.
 
-Der Cron-Eintrag, den es schreibt:
+Der Cron-Eintrag, den es unter `/etc/cron.d/arbitrage-scout` schreibt (Zeiten
+über `SCOUT_CRON_TIME`/`SCOUT_CRON_TZ` überschreibbar, siehe Kopf des Skripts):
 
-```bash
-# Cron: täglich 06:15, Ausgabe landet im rotierenden Logfile
-15 6 * * * cd /opt/arbitrage-scout && /opt/arbitrage-scout/.venv/bin/python scout.py >/dev/null 2>&1
+```
+SHELL=/bin/bash
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+MAILTO=""
+CRON_TZ=Europe/Berlin
+15 6 * * * trader cd /opt/trading/arbitrage-scout && .venv/bin/python scout.py >> logs/cron.log 2>&1
 ```
 
 Ein PID-Lockfile (`logs/scout.lock`) verhindert überlappende Läufe; verwaiste
