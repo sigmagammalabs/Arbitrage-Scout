@@ -227,3 +227,34 @@ def test_send_run_summary_konsumiert_generator_nur_einmal(
 
     notify.send_run_summary(settings, gen(), {}, run_id="r1", offline=False)
     assert "BRITA" in captured_text["t"]
+
+
+# --- Links und Gebinde -----------------------------------------------------------
+def test_links_erscheinen_als_html_anker() -> None:
+    r = make_result(source_url="https://www.amazon.de/dp/B0X", target_url="https://www.ebay.de/itm/1")
+    text = notify.format_run_summary([r], {}, run_id="r1", offline=False)
+    assert '<a href="https://www.amazon.de/dp/B0X">Einkauf</a>' in text
+    assert '<a href="https://www.ebay.de/itm/1">Verkauf</a>' in text
+
+
+def test_link_wird_attributsicher_escaped() -> None:
+    r = make_result(source_url='https://x.de/?a=1&b="2"')
+    text = notify.format_run_summary([r], {}, run_id="r1", offline=False)
+    assert 'href="https://x.de/?a=1&amp;b=&quot;2&quot;"' in text
+
+
+def test_ohne_links_keine_linkzeile() -> None:
+    text = notify.format_run_summary([make_result()], {}, run_id="r1", offline=False)
+    assert "<a href" not in text
+
+
+def test_abweichendes_gebinde_wird_erklaert() -> None:
+    r = make_result(package_quantity_source=12, package_quantity_target=3)
+    text = notify.format_run_summary([r], {}, run_id="r1", offline=False)
+    assert "Gebinde 12 → 3" in text
+    assert "4 Verkäufe" in text
+
+
+def test_gleiches_gebinde_ohne_hinweis() -> None:
+    r = make_result(package_quantity_source=1, package_quantity_target=1)
+    assert "Gebinde" not in notify.format_run_summary([r], {}, run_id="r1", offline=False)

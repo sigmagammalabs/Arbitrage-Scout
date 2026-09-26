@@ -151,9 +151,42 @@ class HttpSourceConfig(BaseModel):
     user_agent: str = "ArbitrageScout/1.0 (+headless)"
 
 
+class ApiSourceConfig(BaseModel):
+    """Automatische Angebotssuche (``sources.provider: api``).
+
+    Die Verkaufsseite ist immer eBay (Browse API). Die Einkaufsseite ist
+    umschaltbar, weil die Amazon Creators API nur fuer Associates mit
+    mindestens 10 qualifizierten Verkaeufen in 30 Tagen freigeschaltet wird --
+    ohne diese Freischaltung laeuft die Automatisierung trotzdem, mit einer
+    selbst gepflegten Einkaufsliste als Quelle.
+    """
+
+    purchase_source: Literal["csv", "amazon"] = "csv"
+    purchase_csv_path: str = "data/purchases.csv"
+
+    amazon_country: str = "DE"
+    # Die Creators API liefert hoechstens 10 Treffer pro Suche.
+    amazon_results_per_keyword: int = Field(10, ge=1, le=10)
+
+    ebay_marketplace: str = "EBAY_DE"
+    # Wie viele eBay-Angebote pro Einkaufsangebot als Kandidaten gelten. Jedes
+    # davon kostet spaeter einen LLM-Aufruf, sofern es den Vorfilter besteht.
+    ebay_results_per_offer: int = Field(5, ge=1, le=50)
+    ebay_new_only: bool = True
+    # best_match: eBays Relevanz. price: guenstigste zuerst -- zeigt die
+    # schaerfste Konkurrenz, liefert aber oefter Zubehoer statt des Produkts.
+    ebay_sort: Literal["best_match", "price"] = "best_match"
+
+    @field_validator("amazon_country", mode="before")
+    @classmethod
+    def _country_upper(cls, v: Any) -> Any:
+        return v.strip().upper() if isinstance(v, str) else v
+
+
 class SourcesConfig(BaseModel):
-    provider: Literal["csv", "mock"] = "csv"
+    provider: Literal["csv", "mock", "api"] = "csv"
     csv: CsvSourceConfig = Field(default_factory=CsvSourceConfig)
+    api: ApiSourceConfig = Field(default_factory=ApiSourceConfig)
     http: HttpSourceConfig = Field(default_factory=HttpSourceConfig)
 
 
@@ -260,14 +293,21 @@ class Secrets(BaseSettings):
     gemini_api_key: SecretStr | None = None
     groq_api_key: SecretStr | None = None
 
+    # eBay Browse API, Application Token (Client Credentials). Im eBay
+    # Developer Portal heisst das Paar "App ID (Client ID)" / "Cert ID
+    # (Client Secret)". Weitere Keys (Dev ID, User Token) braucht die
+    # Browse-Suche nicht.
     ebay_app_id: SecretStr | None = None
     ebay_cert_id: SecretStr | None = None
-    ebay_dev_id: SecretStr | None = None
-    ebay_oauth_token: SecretStr | None = None
 
-    amazon_paapi_access_key: SecretStr | None = None
-    amazon_paapi_secret_key: SecretStr | None = None
-    amazon_paapi_partner_tag: str | None = None
+    # Amazon Creators API (Nachfolger der seit 15.05.2026 abgeschalteten
+    # PA-API 5.0). Die Credential-Version (z. B. "2.2" oder "3.2") steht im
+    # Associates-Portal neben den Zugangsdaten und bestimmt den OAuth-Endpunkt.
+    # Alte AMAZON_PAAPI_*-Eintraege in einer bestehenden .env werden ignoriert.
+    amazon_creators_credential_id: SecretStr | None = None
+    amazon_creators_credential_secret: SecretStr | None = None
+    amazon_creators_credential_version: str | None = None
+    amazon_partner_tag: str | None = None
 
     scraper_api_key: SecretStr | None = None
 
@@ -328,6 +368,61 @@ class Secrets(BaseSettings):
         assert self.telegram_bot_token is not None
         assert self.telegram_chat_id is not None
         return self.telegram_bot_token.get_secret_value().strip(), self.telegram_chat_id.strip()
+
+    @staticmethod
+    def _filled(value: SecretStr | str | None) -> bool:
+        if value is None:
+            return False
+        raw = value.get_secret_value() if isinstance(value, SecretStr) else value
+        return bool(raw.strip())
+
+    @property
+    def has_ebay(self) -> bool:
+        return self._filled(self.ebay_app_id) and self._filled(self.ebay_cert_id)
+
+    def require_ebay(self) -> tuple[str, str]:
+        """(client_id, client_secret) im Klartext."""
+        if not self.has_ebay:
+            raise ConfigError(
+                "EBAY_APP_ID und EBAY_CERT_ID fehlen (eBay Developer Portal -> "
+                "Application Keys -> Production)."
+            )
+        assert self.ebay_app_id is not None and self.ebay_cert_id is not None
+        return (
+            self.ebay_app_id.get_secret_value().strip(),
+            self.ebay_cert_id.get_secret_value().strip(),
+        )
+
+    @property
+    def has_amazon(self) -> bool:
+        return all(
+            self._filled(v)
+            for v in (
+                self.amazon_creators_credential_id,
+                self.amazon_creators_credential_secret,
+                self.amazon_creators_credential_version,
+                self.amazon_partner_tag,
+            )
+        )
+
+    def require_amazon(self) -> tuple[str, str, str, str]:
+        """(credential_id, credential_secret, credential_version, partner_tag)."""
+        if not self.has_amazon:
+            raise ConfigError(
+                "Amazon Creators API unvollstaendig: AMAZON_CREATORS_CREDENTIAL_ID, "
+                "AMAZON_CREATORS_CREDENTIAL_SECRET, AMAZON_CREATORS_CREDENTIAL_VERSION "
+                "und AMAZON_PARTNER_TAG muessen gesetzt sein."
+            )
+        assert self.amazon_creators_credential_id is not None
+        assert self.amazon_creators_credential_secret is not None
+        assert self.amazon_creators_credential_version is not None
+        assert self.amazon_partner_tag is not None
+        return (
+            self.amazon_creators_credential_id.get_secret_value().strip(),
+            self.amazon_creators_credential_secret.get_secret_value().strip(),
+            self.amazon_creators_credential_version.strip(),
+            self.amazon_partner_tag.strip(),
+        )
 
 
 # ---------------------------------------------------------------------------

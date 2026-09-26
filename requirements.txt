@@ -9,3 +9,6 @@ pydantic>=2.7,<3.0
 pydantic-settings>=2.3,<3.0
 PyYAML>=6.0,<7.0
 requests>=2.31,<3.0             # Telegram-Versand/-Listener (notify.py, listener.py)
+# Amazon Creators API (nur fuer sources.api.purchase_source: amazon). Import-Name
+# ist amazon_creatorsapi; fehlt das Paket, bleibt der Rest lauffaehig.
+python-amazon-paapi>=7.1,<8.0

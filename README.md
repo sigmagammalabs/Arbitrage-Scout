@@ -20,7 +20,9 @@ bleibt deterministisch in `calculator.py`.
 | `matcher.py` | Antwortschema, Prompt, Retry, Rate-Limit, Cache, Offline-Heuristik. |
 | `llm_providers.py` | Austauschbare LLM-Backends: Gemini und Groq. |
 | `calculator.py` | Netto-Margenrechner mit Decimal-Arithmetik. |
-| `sources.py` | Woher die Angebote kommen (CSV / Mock; erweiterbar um echte APIs). |
+| `sources.py` | Woher die Angebote kommen: CSV, Mock oder automatisch per API. |
+| `ebay_client.py` | eBay Browse API: passende Verkaufsangebote suchen. |
+| `amazon_client.py` | Amazon Creators API: Einkaufsangebote per Stichwort. |
 | `scout.py` | Orchestrator mit CLI. |
 | `logging_utils.py` | Rotierende Logs, Secret-Redaction, Lauf-ID. |
 | `notify.py` | Telegram-Versand und Nachrichtenformatierung. |
@@ -279,14 +281,67 @@ nie ins Image.
 
 ## Datenquellen
 
-Mitgeliefert sind `csv` (Standard) und `mock` (eingebaute Beispiele,
-`sources.provider: mock`). Ein echter Connector implementiert nur
-`OfferSource.fetch_pairs` in `sources.py`; `scout.py` bleibt unangetastet.
+Drei Modi, umschaltbar über `sources.provider` in `config.yaml`:
+
+| Modus | Einkauf | Verkauf | Wofür |
+|---|---|---|---|
+| `csv` | manuell | manuell | Fertige Paare in `data/offers.csv` prüfen lassen |
+| `api` | Einkaufsliste **oder** Amazon | eBay automatisch | Der eigentliche Scout-Betrieb |
+| `mock` | eingebaut | eingebaut | Nur Pipeline-Test — **keine echten Angebote** |
+
+### `api` — automatische Suche
+
+Für jedes Einkaufsangebot sucht der Scout über die **eBay Browse API** passende
+aktive Angebote auf eBay.de — per EAN, wenn vorhanden (trifft exakt das
+Produkt), sonst per Titel. Jedes gefundene eBay-Angebot wird ein Kandidat, den
+Vorfilter, LLM-Matcher und Margenrechner wie gewohnt prüfen. Links zu beiden
+Angeboten erscheinen im Report und in der Telegram-Nachricht.
+
+Die **Einkaufsseite** ist umschaltbar (`sources.api.purchase_source`):
+
+- **`csv`** (Standard): Einkaufsliste `data/purchases.csv` — ein Angebot pro
+  Zeile, mit Link. Funktioniert für alles: Amazon, AliExpress, Händler-Shops.
+  Du findest ein Angebot, trägst es ein, der Rest läuft automatisch.
+  Vorlage: `python scout.py --write-example-data` → `data/purchases.example.csv`
+  (Werte dort sind Platzhalter, keine recherchierten Preise). Pflicht sind nur
+  `title` und `price_eur`; eine `ean` macht die eBay-Suche deutlich präziser,
+  `qty` die Gebindenormierung zuverlässiger.
+- **`amazon`**: Stichwortsuche über die Amazon Creators API mit den Suchbegriffen
+  aus `search.categories`.
+
+**Voraussetzungen:**
+
+- eBay: kostenloser [Developer-Account](https://developer.ebay.com), Production
+  Keyset → `EBAY_APP_ID` (Client ID) und `EBAY_CERT_ID` (Client Secret).
+- Amazon: Die Product Advertising API 5.0 wurde am 15.05.2026 abgeschaltet;
+  Nachfolger ist die Creators API. Zugang nur mit endgültig freigeschaltetem
+  Associates-Account und **mindestens 10 qualifizierten Verkäufen in den letzten
+  30 Tagen**. Ohne diese Freischaltung bleibt die Einkaufsliste der Weg.
+
+**Was die Zahlen bedeuten — und was nicht:**
+
+- eBay liefert nur **aktive** Angebote, keine tatsächlich erzielten
+  Verkaufspreise. Ein aktives Angebot zeigt, was Konkurrenten verlangen, nicht,
+  was Käufer zahlen. Die Kalkulation ist damit eine Obergrenze.
+- Amazon liefert keine Versandkosten; sie werden mit 0 angesetzt — bei Prime und
+  Buy-Box-Angeboten meist richtig, sonst zu optimistisch.
+- `ebay_results_per_offer: 5` heißt: bis zu 5 Kandidaten je Einkaufsangebot,
+  jeder davon ggf. ein LLM-Aufruf. 20 Einkaufsangebote → bis zu 100 Aufrufe.
+  `search.max_candidates_per_run` begrenzt das hart — und bricht auch die
+  API-Abfragen ab, nicht nur die Prüfung.
+
+Fällt eine Quelle mitten im Lauf aus (z. B. Token entzogen), bleiben die bis
+dahin geprüften Ergebnisse erhalten und werden exportiert bzw. gemeldet.
+
+### `csv` — fertige Paare
+
+`data/offers.csv` mit Einkauf und Verkauf je Zeile, Spalten wie in
+`data/offers.example.csv`. Links in `source_url`/`target_url` erscheinen im
+Report. Die Beispieldatei enthält **erfundene Testdaten** zum Prüfen der
+Pipeline — nicht darauf kaufen.
 
 Bewusst nicht enthalten ist Scraping gegen Amazon oder eBay — das verstößt gegen
-deren Nutzungsbedingungen. Vorgesehener Weg sind die offiziellen APIs
-(eBay Browse API, Amazon PA-API) oder ein lizenzierter Datenanbieter; die
-Zugangsdaten dafür sind in `.env.example` bereits vorgesehen.
+deren Nutzungsbedingungen.
 
 ## Telegram
 
@@ -338,7 +393,7 @@ pip install -r requirements-dev.txt
 python -m pytest tests -q
 ```
 
-108 Tests, ohne Netzwerk. Der LLM-Online-Pfad wird mit eingeschleusten
+178 Tests, ohne Netzwerk. Der LLM-Online-Pfad wird mit eingeschleusten
 Fake-Providern geprüft: Retry bei 429/5xx, Abbruch nach `max_retries`, kein
 Retry bei fachlichen Fehlern, Weiterlaufen nach Einzelfehlern, und für Groq der
 Rückfall von `json_schema` auf den JSON-Modus. Der Listener wird mit einem

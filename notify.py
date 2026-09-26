@@ -68,12 +68,28 @@ def _format_recommendation(r: Any) -> str:
     """Eine Zeile pro Empfehlung. ``r`` ist ein ``scout.ScoutResult`` (oder
     strukturell aequivalent) -- siehe Modul-Docstring zum Duck-Typing."""
     title = escape(r.target_title[:70])
-    return (
+    line = (
         f"• <b>{title}</b>\n"
         f"  {r.source_marketplace} {r.source_price_eur:.2f} € → "
         f"{r.target_marketplace} {r.target_price_eur:.2f} €  "
         f"| Gewinn {r.net_profit_eur:+.2f} €  ROI {r.roi_percent:.1f} %"
     )
+    # Ohne Gebindehinweis wirkt "Einkauf 39,99 -> Verkauf 34,90" wie ein
+    # Verlustgeschaeft, obwohl aus einem 12er-Pack vier 3er-Packs werden.
+    qty_source = getattr(r, "package_quantity_source", 1) or 1
+    qty_target = getattr(r, "package_quantity_target", 1) or 1
+    if qty_source != qty_target:
+        line += f"\n  Gebinde {qty_source} → {qty_target} Stk. (Einkauf deckt {qty_source / qty_target:g} Verkäufe)"
+
+    # getattr statt Attributzugriff: Links sind optional (CSV ohne URL-Spalte).
+    links = []
+    for label, url in (("Einkauf", getattr(r, "source_url", None)),
+                       ("Verkauf", getattr(r, "target_url", None))):
+        if url:
+            links.append(f'<a href="{escape(str(url), quote=True)}">{label}</a>')
+    if links:
+        line += "\n  " + " · ".join(links)
+    return line
 
 
 def format_run_summary(

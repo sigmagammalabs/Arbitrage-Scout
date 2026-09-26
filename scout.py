@@ -50,7 +50,13 @@ from matcher import (
 from logging_utils import RUN_ID, get_logger, setup_logging
 from models import CandidatePair
 from notify import send_run_summary
-from sources import OfferSource, SourceError, build_source, write_example_csv
+from sources import (
+    OfferSource,
+    SourceError,
+    build_source,
+    write_example_csv,
+    write_purchase_example,
+)
 
 logger = get_logger(__name__)
 
@@ -219,12 +225,30 @@ class Scout:
             logger.error("Datenquelle nicht verfuegbar: %s", exc)
             raise
 
-        for pair in pairs:
+        iterator = iter(pairs)
+        while True:
+            # Abbruch und Limit VOR dem naechsten Abruf pruefen: bei der
+            # API-Quelle kostet jedes weitere Paar einen eBay-Aufruf.
             if _shutdown_requested:
                 logger.warning("Abbruch angefordert - Lauf wird beendet.")
                 break
             if self.stats["seen"] >= max_items:
                 logger.info("Limit von %d Kandidaten erreicht.", max_items)
+                break
+
+            # Quellen sind Generatoren: Fehler kommen erst beim Abruf, nicht
+            # beim Anlegen. Faellt die Quelle mitten im Lauf aus (z. B. Token
+            # entzogen), bleiben die bisherigen Ergebnisse erhalten.
+            try:
+                pair = next(iterator)
+            except StopIteration:
+                break
+            except SourceError as exc:
+                if self.stats["seen"] == 0:
+                    logger.error("Datenquelle nicht verfuegbar: %s", exc)
+                    raise
+                self.stats["errors"] += 1
+                logger.error("Datenquelle waehrend des Laufs ausgefallen, Abbruch: %s", exc)
                 break
 
             self.stats["seen"] += 1
@@ -591,6 +615,15 @@ def main(argv: list[str] | None = None) -> int:
         print(f"Logdatei:       {settings.log_file}")
         print(f"Ergebnisse:     {settings.results_dir}")
         print(f"Datenquelle:    {cfg.sources.provider}")
+        if cfg.sources.provider == "api":
+            api_cfg = cfg.sources.api
+            print(f"  Einkauf:      {api_cfg.purchase_source}"
+                  + (f" ({settings.resolve(api_cfg.purchase_csv_path)})"
+                     if api_cfg.purchase_source == "csv" else f" ({api_cfg.amazon_country})"))
+            print(f"  Verkauf:      eBay {api_cfg.ebay_marketplace}")
+            print(f"  eBay-Keys:    {'gesetzt' if settings.secrets.has_ebay else 'FEHLEN (EBAY_APP_ID/EBAY_CERT_ID)'}")
+            if api_cfg.purchase_source == "amazon":
+                print(f"  Amazon-Keys:  {'gesetzt' if settings.secrets.has_amazon else 'FEHLEN (AMAZON_CREATORS_*, AMAZON_PARTNER_TAG)'}")
         provider = cfg.llm.provider
         model = cfg.groq.model if provider == "groq" else cfg.gemini.model
         print(f"LLM-Provider:   {provider} ({model})")
@@ -609,6 +642,8 @@ def main(argv: list[str] | None = None) -> int:
     if args.write_example_data:
         path = write_example_csv(settings.resolve("data/offers.example.csv"))
         print(f"Beispieldaten geschrieben: {path}")
+        path = write_purchase_example(settings.resolve("data/purchases.example.csv"))
+        print(f"Vorlage Einkaufsliste:     {path}")
         return EXIT_OK
 
     signal.signal(signal.SIGINT, _request_shutdown)
@@ -640,6 +675,10 @@ def _execute(settings: Settings, args: argparse.Namespace) -> int:
         )
     except MatcherError as exc:
         logger.error("Matcher nicht initialisierbar: %s", exc)
+        return EXIT_CONFIG
+    except SourceError as exc:
+        # Fehlende Marktplatz-Keys o. ae. -- ein Konfigurations-, kein Laufzeitfehler.
+        logger.error("Datenquelle nicht initialisierbar: %s", exc)
         return EXIT_CONFIG
 
     try:

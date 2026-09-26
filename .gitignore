@@ -9,6 +9,7 @@ logs/
 data/*.csv
 data/*.json
 !data/offers.example.csv
+!data/purchases.example.csv
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/

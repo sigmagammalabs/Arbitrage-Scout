@@ -76,11 +76,28 @@ groq:
 
 # --- Datenquellen ----------------------------------------------------------
 sources:
-  # Aktuell implementiert: "csv" (Offline-/Testbetrieb) und "mock".
-  # Echte Marktplatz-Connectoren werden in sources/ ergaenzt.
+  #   csv  -- fertige Paare (Einkauf + Verkauf) aus data/offers.csv, manuell gepflegt
+  #   mock -- eingebaute Testfaelle, keine echten Angebote
+  #   api  -- automatisch: Einkaufsangebote (Liste oder Amazon) -> passende eBay-Angebote
   provider: "csv"
   csv:
     offers_path: "data/offers.csv"
+  api:
+    # Einkaufsseite:
+    #   csv    -- Einkaufsliste data/purchases.csv (Amazon, AliExpress, beliebig;
+    #             Vorlage: python scout.py --write-example-data)
+    #   amazon -- Amazon Creators API. Nur mit freigeschaltetem Associates-Account
+    #             und >=10 qualifizierten Verkaeufen in 30 Tagen.
+    purchase_source: "csv"
+    purchase_csv_path: "data/purchases.csv"
+    amazon_country: "DE"
+    amazon_results_per_keyword: 10   # Maximum der Creators API
+    # Verkaufsseite ist immer eBay (Browse API, nur aktive Angebote -- keine
+    # tatsaechlich erzielten Verkaufspreise).
+    ebay_marketplace: "EBAY_DE"
+    ebay_results_per_offer: 5        # Kandidaten je Einkaufsangebot (je einer = ggf. 1 LLM-Aufruf)
+    ebay_new_only: true
+    ebay_sort: "best_match"          # best_match | price
   http:
     timeout_seconds: 20
     max_retries: 3
