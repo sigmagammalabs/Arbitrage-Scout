@@ -20,6 +20,12 @@ ENV PYTHONUNBUFFERED=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
     TZ=Europe/Berlin
 
+# python:*-slim bringt keine Zeitzonen-Datenbank mit -- ohne tzdata wird
+# TZ=Europe/Berlin still ignoriert und Logs/Zeitstempel laufen in UTC.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends tzdata \
+    && rm -rf /var/lib/apt/lists/*
+
 WORKDIR /app
 
 # Abhaengigkeiten zuerst -- bleibt bei Codeaenderungen im Build-Cache.

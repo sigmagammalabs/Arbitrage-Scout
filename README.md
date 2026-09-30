@@ -279,6 +279,19 @@ Cron läuft auf dem Host, ein Container pro Lauf — einfacher zu überwachen al
 ein Daemon mit eigenem `crond`. Secrets kommen zur Laufzeit über `--env-file`,
 nie ins Image.
 
+**Fertige Images:** Bei jedem Push nach `main` testet und baut GitHub Actions
+(`.github/workflows/docker-publish.yml`) das Image für amd64 und arm64 und legt
+es ab als `ghcr.io/sigmagammalabs/arbitrage-scout:latest` und
+`:sha-<commit>` (für Rollbacks).
+
+**VPS mit Portainer:** Dort läuft der Scout als eigener Docker-Stack —
+Telegram-Listener als Dauerprozess, der tägliche Lauf wird per `docker exec` im
+selben Container gestartet, damit `/stop` und das Lockfile weiter greifen. Die
+Stack-Definition liegt im Plattform-Repo `vps-platform`
+(`stacks/arbitrage-scout`). Die systemd/cron-Einrichtung über
+`deploy/vps_setup.sh` bleibt als Alternative erhalten — beide Wege nicht
+parallel auf demselben Server betreiben, sonst laufen Scans doppelt.
+
 ## Datenquellen
 
 Drei Modi, umschaltbar über `sources.provider` in `config.yaml`:
