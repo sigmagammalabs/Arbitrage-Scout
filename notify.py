@@ -171,3 +171,96 @@ def send_run_summary(
         max_items=settings.config.telegram.max_recommendations_in_message,
     )
     return send_message(settings, text)
+
+
+def _link(label: str, url: Any) -> str:
+    return f'<a href="{escape(str(url), quote=True)}">{label}</a>'
+
+
+def format_discovery_summary(
+    items: Iterable[Any],
+    deals: Iterable[Any],
+    stats: Mapping[str, int],
+    *,
+    run_id: str,
+    max_items: int = 10,
+) -> str:
+    """Fundliste der Produktfindung (``scout.py --discover``) fuer Telegram.
+
+    ``items`` sind ``discovery.HotItem`` (duck-typed wie oben), ``deals`` die
+    Ergebnisse einer Amazon-Gegenpruefung, falls es eine gab.
+    """
+    items = list(items)
+    confirmed = [d for d in deals if d.is_recommended]
+    lines = [f"🔎 <b>Produktfindung</b> — Lauf {escape(run_id)}", ""]
+
+    if not items:
+        lines.append("Keine gut laufenden Artikel, die die Kriterien erfuellen.")
+    else:
+        lines.append(f"<b>{len(items)} gut laufende Artikel</b> (eBay.de):")
+        for idx, item in enumerate(items[:max_items], start=1):
+            pace = (
+                f"{item.sold_quantity} verkauft, ~{item.sold_per_day:.1f}/Tag"
+                if item.sold_per_day is not None
+                else f"{item.sold_quantity} verkauft"
+            )
+            lines.append(f"{idx}. <b>{escape(item.title[:64])}</b>")
+            lines.append(
+                f"   {item.price_eur:.2f} € · {pace} · "
+                f"max. Einkauf <b>{item.max_purchase_price_eur:.2f} €</b>"
+            )
+            if item.competing_listings > 1 and item.lowest_competitor_price_eur is not None:
+                note = (
+                    f"   {item.competing_listings} Anbieter, guenstigster "
+                    f"{item.lowest_competitor_price_eur:.2f} €"
+                )
+                at_lowest = getattr(item, "max_purchase_at_lowest_price_eur", None)
+                if at_lowest is not None:
+                    note += (
+                        f" → dann max. Einkauf {at_lowest:.2f} €" if at_lowest > 0
+                        else " → zu dem Preis nicht rentabel"
+                    )
+                lines.append(note)
+            links = [_link("eBay", item.url)] if item.url else []
+            links += [_link(label, url) for label, url in list(item.research_links.items())[:3]]
+            if links:
+                lines.append("   " + " · ".join(links))
+        if len(items) > max_items:
+            lines.append(f"… und {len(items) - max_items} weitere im Export.")
+
+    if confirmed:
+        lines.append("")
+        lines.append(f"✅ <b>{len(confirmed)} davon mit Amazon-Einkaufsquelle bestaetigt:</b>")
+        for deal in confirmed[:max_items]:
+            lines.append(_format_recommendation(deal))
+
+    lines.append("")
+    lines.append(
+        f"{stats.get('detail_lookups', 0)} Angebote geprueft · "
+        f"{stats.get('api_calls', 0)} eBay-Aufrufe"
+    )
+    lines.append("Stueckzahlen sind eBays Schaetzung je Angebot, Preise sind Angebotspreise.")
+
+    message = "\n".join(lines)
+    if len(message) > MAX_MESSAGE_LENGTH:
+        message = message[: MAX_MESSAGE_LENGTH - 20].rstrip() + "\n…"
+    return message
+
+
+def send_discovery_summary(
+    settings: Settings,
+    items: Iterable[Any],
+    deals: Iterable[Any],
+    stats: Mapping[str, int],
+    *,
+    run_id: str,
+) -> bool:
+    items = list(items)
+    if not items and not settings.config.telegram.notify_on_empty:
+        return False
+    text = format_discovery_summary(
+        items, list(deals), stats,
+        run_id=run_id,
+        max_items=settings.config.telegram.max_recommendations_in_message,
+    )
+    return send_message(settings, text)

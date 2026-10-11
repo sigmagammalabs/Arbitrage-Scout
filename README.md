@@ -23,6 +23,7 @@ bleibt deterministisch in `calculator.py`.
 | `sources.py` | Woher die Angebote kommen: CSV, Mock oder automatisch per API. |
 | `ebay_client.py` | eBay Browse API: passende Verkaufsangebote suchen. |
 | `amazon_client.py` | Amazon Creators API: Einkaufsangebote per Stichwort. |
+| `discovery.py` | Produktfindung: gut laufende eBay-Artikel, max. Einkaufspreis. |
 | `scout.py` | Orchestrator mit CLI. |
 | `logging_utils.py` | Rotierende Logs, Secret-Redaction, Lauf-ID. |
 | `notify.py` | Telegram-Versand und Nachrichtenformatierung. |
@@ -69,6 +70,7 @@ oder `GROQ_API_KEY`.
 --provider NAME        LLM-Backend für diesen Lauf (gemini | groq)
 --offline              Heuristik statt LLM, Export bleibt aktiv
 --notify-telegram      Zusammenfassung nach Lauf-Ende an Telegram senden
+--discover             Produktfindung: gut laufende eBay-Artikel suchen
 --no-prefilter         Jedes Paar ans LLM schicken (teurer, vollständiger)
 --no-export            Nicht auf die Platte schreiben
 --no-lock              Ohne Lockfile laufen
@@ -356,6 +358,63 @@ Pipeline — nicht darauf kaufen.
 Bewusst nicht enthalten ist Scraping gegen Amazon oder eBay — das verstößt gegen
 deren Nutzungsbedingungen.
 
+## Produktfindung von der eBay-Seite
+
+Der normale Lauf geht vom Einkauf aus: „Ich habe ein Angebot — lohnt es sich?"
+`--discover` dreht die Richtung um: **Was verkauft sich auf eBay.de, und was darf
+ich dafür im Einkauf höchstens zahlen?**
+
+```bash
+python scout.py --discover                       # alle Kategorien aus config.yaml
+python scout.py --discover --category haushalt --limit 10
+python scout.py --discover --notify-telegram     # Fundliste aufs Handy
+```
+
+Braucht nur die eBay-Keys (`EBAY_APP_ID`, `EBAY_CERT_ID`), kein LLM. Zu jedem
+Suchbegriff aus `search.categories` holt der Scout eBays relevanteste
+Festpreis-Angebote (neu, Lieferung nach Deutschland), fragt für die obersten
+die geschätzte Verkaufsmenge ab und sortiert nach Verkaufstempo. Pro Fund gibt
+es:
+
+- **Verkaufstempo** — verkaufte Stück geteilt durch das Alter des Angebots
+- **Max. Einkauf** — der höchste Einkaufspreis, bei dem `min_profit_eur` und
+  `min_roi_percent` noch erreicht werden (Umkehrung der Margenrechnung)
+- **Konkurrenzlage** — verkaufen mehrere Händler dasselbe Produkt (gleiche EAN),
+  wird es ein Eintrag; liegt einer günstiger, steht zusätzlich der Höchstpreis
+  für *dessen* Preis dabei
+- **Suchlinks** für die Einkaufsrecherche (Amazon, idealo, Google Shopping,
+  AliExpress) — per EAN, wenn vorhanden. Nur Links zum Anklicken; der Scout
+  ruft diese Seiten nicht selbst ab.
+
+Artikel, die sich zwar verkaufen, deren Preis aber Gebühren, Versand und
+Mindestgewinn selbst bei Einkauf zu 0 € nicht trägt, fliegen raus.
+
+**Vom Fund zum Kauf:** Angebot über die Links suchen → in `data/purchases.csv`
+eintragen → der normale Lauf (`sources.provider: api`) prüft es mit Matcher und
+voller Kalkulation. Mit Amazon-Creators-Zugang sucht `--discover` die
+Einkaufsquelle zusätzlich selbst und schickt die Paare durch dieselbe Prüfung.
+
+**Was die Zahlen bedeuten — und was nicht:**
+
+- Die Verkaufsmenge (`estimatedSoldQuantity`) ist eBays *Schätzung* für *dieses
+  eine Angebot* seit seiner Erstellung. Ein Tempo-Hinweis, kein Marktvolumen;
+  wird ein Angebot neu eingestellt, beginnt die Zählung von vorn.
+- Preise sind Angebots-, keine erzielten Verkaufspreise. Echte Verkaufsdaten
+  hat nur die Marketplace Insights API, die eBay für neue Nutzer gesperrt hat.
+- „Max. Einkauf" rechnet mit Gebinde 1:1. Wer ein Großgebinde aufteilt, darf
+  entsprechend mehr zahlen — das prüft der normale Lauf.
+- Varianten-Angebote (Größe/Farbe als Auswahl) lassen sich über diesen Weg
+  nicht im Detail abrufen und werden übersprungen.
+
+**Bestseller-Listen:** Zusätzlich fragt der Scout eBays eigene Bestseller-Liste
+der Kategorie ab, in der die Suchtreffer überwiegend liegen (Marketing API,
+Beta). Das braucht die Berechtigung `buy.marketing`, die nicht jedes Keyset hat.
+Fehlt sie, erscheint einmal ein Hinweis im Log und der Rest läuft unverändert.
+
+**Kosten:** Ein eBay-Aufruf je geprüftem Angebot. Mit den Vorgaben sind das
+rund 16 Aufrufe je Suchbegriff; `discovery.max_api_calls` (300) deckelt den Lauf,
+eBays Standardkontingent liegt bei 5.000 pro Tag.
+
 ## Telegram
 
 Zwei unabhängige Bausteine, beide optional — ohne `TELEGRAM_BOT_TOKEN` und
@@ -373,6 +432,7 @@ systemd-Dienst, getrennt vom Cronjob.
 
 ```
 /scan, /run   Lauf sofort starten (--notify-telegram, --quiet)
+/discover     Produktfindung starten (gut laufende eBay-Artikel)
 /stop         Aktiven Lauf abbrechen — egal ob per Chat oder per Cron gestartet
 /status       Läuft gerade etwas?
 /start, /help Kurzübersicht
@@ -406,7 +466,7 @@ pip install -r requirements-dev.txt
 python -m pytest tests -q
 ```
 
-178 Tests, ohne Netzwerk. Der LLM-Online-Pfad wird mit eingeschleusten
+234 Tests, ohne Netzwerk. Der LLM-Online-Pfad wird mit eingeschleusten
 Fake-Providern geprüft: Retry bei 429/5xx, Abbruch nach `max_retries`, kein
 Retry bei fachlichen Fehlern, Weiterlaufen nach Einzelfehlern, und für Groq der
 Rückfall von `json_schema` auf den JSON-Modus. Der Listener wird mit einem

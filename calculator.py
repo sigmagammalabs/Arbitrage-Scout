@@ -19,7 +19,7 @@ nicht durch Float-Rundung wandern.
 
 from __future__ import annotations
 
-from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
+from decimal import ROUND_DOWN, ROUND_HALF_UP, Decimal, InvalidOperation
 from typing import Any
 
 from pydantic import BaseModel, Field
@@ -280,6 +280,71 @@ class MarginCalculator:
         if k <= ZERO:  # durch die Konfigvalidierung eigentlich ausgeschlossen
             return Decimal("0")
         return (fixed_block + target_profit) / k
+
+    def max_purchase_price(
+        self,
+        *,
+        sale_price_eur: float | Decimal,
+        sale_shipping_income_eur: float | Decimal = 0.0,
+        quantity_source: int = 1,
+        quantity_target: int = 1,
+    ) -> float:
+        """Hoechster Einkaufspreis (inkl. Versand zum Lager), bei dem ein Verkauf
+        zum gegebenen Preis noch beide Schwellen (Mindestgewinn, Mindest-ROI)
+        erreicht. 0.0, wenn der Verkaufspreis dafuer grundsaetzlich nicht reicht.
+
+        Die Umkehrung von :meth:`calculate` -- gebraucht, wenn die Verkaufsseite
+        feststeht und die Frage lautet: "Was darf ich im Einkauf zahlen?"
+        """
+        if quantity_source < 1 or quantity_target < 1:
+            raise CalculationError("Stueckzahlen muessen >= 1 sein.")
+        gross = _dec(sale_price_eur) + _dec(sale_shipping_income_eur)
+        if gross <= ZERO:
+            return 0.0
+
+        k = Decimal("1") - self._variable_rate
+        fixed_fee = _dec(self.costs.ebay_fixed_fee_eur)
+        logistics = _dec(self.costs.shipping_cost_domestic_eur) + _dec(self.costs.packaging_cost_eur)
+        roi = _pct(self.margin.min_roi_percent)
+
+        # Gewinn = gross*k - fixed_fee - COGS - logistics; Kapital = COGS + logistics.
+        by_profit = gross * k - fixed_fee - logistics - _dec(self.margin.min_profit_eur)
+        by_roi = (gross * k - fixed_fee - logistics * (Decimal("1") + roi)) / (Decimal("1") + roi)
+        max_cogs = min(by_profit, by_roi)
+        if max_cogs <= ZERO:
+            return 0.0
+
+        # COGS -> Einkaufspreis: Gebinde, Vorsteuer, Zoll, Wareneingang herausrechnen.
+        units_per_sale = _dec(quantity_target) / _dec(quantity_source)
+        vat_credit_share = ZERO
+        if self.tax.vat_registered and self.tax.input_vat_deductible:
+            rate = _pct(self.tax.vat_rate_percent)
+            vat_credit_share = rate / (Decimal("1") + rate)
+        procurement = max_cogs / units_per_sale / (Decimal("1") - vat_credit_share)
+        landed = (procurement - _dec(self.costs.inbound_shipping_eur)) / (
+            Decimal("1") + _pct(self.costs.import_duty_percent)
+        )
+        if landed <= ZERO:
+            return 0.0
+
+        # Abrunden und gegen calculate() absichern: dort wird je Posten auf Cent
+        # gerundet, die geschlossene Formel kann deshalb um einen Cent daneben
+        # liegen. Der zurueckgegebene Preis soll garantiert noch empfohlen sein.
+        candidate = landed.quantize(CENT, rounding=ROUND_DOWN)
+        for _ in range(5):
+            if candidate <= ZERO:
+                return 0.0
+            check = self.calculate(
+                purchase_price_eur=candidate,
+                sale_price_eur=sale_price_eur,
+                sale_shipping_income_eur=sale_shipping_income_eur,
+                quantity_source=quantity_source,
+                quantity_target=quantity_target,
+            )
+            if check.is_recommended:
+                return float(candidate)
+            candidate -= CENT
+        return float(max(candidate, ZERO))
 
     def _apply_thresholds(self, b: MarginBreakdown) -> None:
         """Schwellenwerte pruefen und Ablehnungsgruende im Klartext hinterlegen."""

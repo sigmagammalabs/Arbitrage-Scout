@@ -9,6 +9,7 @@ Befehle:
                      jemand den Chat oeffnet -- deshalb loest es bewusst KEINEN
                      Scan aus, sonst kostet schon das Oeffnen des Chats Geld).
     /scan, /run      Sofortigen Lauf anstossen (--notify-telegram, --quiet).
+    /discover        Produktfindung anstossen (scout.py --discover).
     /stop            Aktiven Lauf abbrechen -- egal ob ueber den Listener oder
                      per Cron gestartet (ueber das PID-Lockfile erkannt).
     /status          Zeigt, ob gerade ein Lauf aktiv ist.
@@ -51,6 +52,7 @@ TERMINATE_GRACE_SECONDS = 60.0
 HELP_TEXT = (
     "🤖 <b>Arbitrage Scout Bot</b>\n\n"
     "/scan – Lauf jetzt starten (nutzt config.yaml-Schwellen, sendet Ergebnis hierher)\n"
+    "/discover – Gut laufende eBay-Artikel suchen (Produktfindung)\n"
     "/stop – Aktiven Lauf abbrechen (Cron oder /scan)\n"
     "/status – Laeuft gerade etwas?\n"
     "/help – Diese Uebersicht"
@@ -90,9 +92,15 @@ class ListenerState:
     Tests einen Fake mit derselben Schnittstelle (poll/terminate/kill/pid).
     """
 
-    def __init__(self, lock_path: Path, spawn: Callable[[], Any]) -> None:
+    def __init__(
+        self,
+        lock_path: Path,
+        spawn: Callable[[], Any],
+        spawn_discovery: Callable[[], Any] | None = None,
+    ) -> None:
         self.lock_path = lock_path
         self._spawn = spawn
+        self._spawn_discovery = spawn_discovery or spawn
         self.process: Any = None
         self.started_at: datetime | None = None
         self.terminate_requested_at: datetime | None = None
@@ -100,7 +108,7 @@ class ListenerState:
     def _own_process_alive(self) -> bool:
         return self.process is not None and self.process.poll() is None
 
-    def start(self) -> str:
+    def start(self, *, discover: bool = False) -> str:
         if self._own_process_alive():
             started = self.started_at.strftime("%H:%M:%S") if self.started_at else "?"
             return f"⏳ Ein Lauf ist bereits aktiv (gestartet um {started}). /stop zum Abbrechen."
@@ -109,10 +117,11 @@ class ListenerState:
         if external_pid is not None:
             return f"⏳ Ein Lauf ist bereits aktiv (PID {external_pid}, z. B. per Cron). /stop zum Abbrechen."
 
-        self.process = self._spawn()
+        self.process = self._spawn_discovery() if discover else self._spawn()
         self.started_at = datetime.now(timezone.utc)
         self.terminate_requested_at = None
-        return f"▶️ Lauf gestartet (PID {self.process.pid}). Ich melde mich, wenn er fertig ist."
+        what = "Produktfindung" if discover else "Lauf"
+        return f"▶️ {what} gestartet (PID {self.process.pid}). Ich melde mich, wenn er fertig ist."
 
     def stop(self) -> str:
         if self._own_process_alive():
@@ -171,7 +180,7 @@ class ListenerState:
         return None
 
 
-def _spawn_scan(python_bin: str = sys.executable) -> subprocess.Popen:
+def _spawn_scan(python_bin: str = sys.executable, *, discover: bool = False) -> subprocess.Popen:
     """Scout als eigenstaendigen Prozess starten.
 
     ``--notify-telegram`` laesst scout.py die Ergebnis-Nachricht selbst senden
@@ -180,7 +189,8 @@ def _spawn_scan(python_bin: str = sys.executable) -> subprocess.Popen:
     Klartext-Report auf stdout, der hier niemand liest.
     """
     return subprocess.Popen(
-        [python_bin, str(SCOUT_SCRIPT), "--notify-telegram", "--quiet"],
+        [python_bin, str(SCOUT_SCRIPT), "--notify-telegram", "--quiet"]
+        + (["--discover"] if discover else []),
         cwd=str(PROJECT_DIR),
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
@@ -194,6 +204,8 @@ def dispatch(text: str, state: ListenerState) -> str | None:
 
     if command in ("/scan", "/run"):
         return state.start()
+    if command == "/discover":
+        return state.start(discover=True)
     if command == "/stop":
         return state.stop()
     if command == "/status":
@@ -204,7 +216,11 @@ def dispatch(text: str, state: ListenerState) -> str | None:
 def run_listener(settings: Settings) -> None:
     token, chat_id = settings.secrets.require_telegram()
     lock_path = settings.resolve("logs/scout.lock")
-    state = ListenerState(lock_path, spawn=_spawn_scan)
+    state = ListenerState(
+        lock_path,
+        spawn=_spawn_scan,
+        spawn_discovery=lambda: _spawn_scan(discover=True),
+    )
 
     poll_seconds = settings.config.telegram.long_poll_seconds
     url = GET_UPDATES_URL.format(token=token)

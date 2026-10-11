@@ -256,6 +256,28 @@ class LoggingConfig(BaseModel):
         return v.upper() if isinstance(v, str) else v
 
 
+class DiscoveryConfig(BaseModel):
+    """Produktfindung von der eBay-Seite (``scout.py --discover``).
+
+    Jeder Detailabruf kostet einen eBay-API-Aufruf; ``max_api_calls`` ist die
+    harte Obergrenze je Lauf (eBays Standardkontingent: 5.000 pro Tag).
+    """
+
+    results_per_keyword: int = Field(30, ge=1, le=200)
+    # Nur fuer die obersten Treffer wird die Verkaufsmenge abgerufen.
+    detail_lookups_per_keyword: int = Field(15, ge=1, le=100)
+    min_sold_quantity: int = Field(10, ge=0)
+    min_sold_per_day: float = Field(0.0, ge=0.0)
+    max_results: int = Field(20, ge=1, le=200)
+    max_api_calls: int = Field(300, ge=10, le=5000)
+    # eBays Bestseller-Liste je Kategorie. Braucht die Zusatzberechtigung
+    # buy.marketing; fehlt sie, schaltet sich die Funktion fuer den Lauf ab.
+    use_bestseller_lists: bool = True
+    bestsellers_per_category: int = Field(10, ge=1, le=100)
+    # Nur mit Amazon-Creators-Zugang: so viele Amazon-Treffer je Artikel pruefen.
+    amazon_candidates_per_item: int = Field(3, ge=1, le=10)
+
+
 class TelegramConfig(BaseModel):
     """Einstellungen fuer Benachrichtigung (``scout.py --notify-telegram``) und
     den optionalen Listener (``listener.py``). Zugangsdaten stehen in
@@ -492,6 +514,7 @@ class AppConfig(BaseSettings):
     output: OutputConfig = Field(default_factory=OutputConfig)
     logging: LoggingConfig = Field(default_factory=LoggingConfig)
     telegram: TelegramConfig = Field(default_factory=TelegramConfig)
+    discovery: DiscoveryConfig = Field(default_factory=DiscoveryConfig)
 
 
 class Settings(BaseModel):

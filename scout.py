@@ -39,8 +39,10 @@ from typing import Any, Iterable
 
 from pydantic import BaseModel
 
+from amazon_client import AmazonError
 from calculator import MarginBreakdown, MarginCalculator, format_breakdown
 from config import ConfigError, Settings, load_settings
+from discovery import Discoverer, DiscoveryError, HotItem, amazon_pairs
 from matcher import (
     MatchDecision,
     MatcherError,
@@ -49,10 +51,12 @@ from matcher import (
 )
 from logging_utils import RUN_ID, get_logger, setup_logging
 from models import CandidatePair
-from notify import send_run_summary
+from notify import send_discovery_summary, send_run_summary
 from sources import (
     OfferSource,
     SourceError,
+    build_amazon_client,
+    build_ebay_client,
     build_source,
     write_example_csv,
     write_purchase_example,
@@ -446,6 +450,241 @@ def print_report(results: list[ScoutResult], *, verbose: bool = False) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Produktfindung (--discover)
+# ---------------------------------------------------------------------------
+def export_discovery(settings: Settings, items: list[HotItem], deals: list[ScoutResult]) -> list[Path]:
+    """Fundliste nach CSV und/oder JSON schreiben."""
+    cfg = settings.config.output
+    if not items:
+        logger.info("Nichts zu exportieren.")
+        return []
+    out_dir = settings.results_dir
+    try:
+        out_dir.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        logger.error("Ausgabeverzeichnis %s nicht anlegbar: %s", out_dir, exc)
+        return []
+
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    written: list[Path] = []
+
+    if cfg.write_csv:
+        path = out_dir / f"discovery-{stamp}.csv"
+        fields = [
+            "rank", "title", "price_eur", "shipping_eur", "sold_quantity", "days_listed",
+            "sold_per_day", "competing_listings", "lowest_competitor_price_eur",
+            "max_purchase_price_eur", "max_purchase_at_lowest_price_eur",
+            "gtin", "brand", "mpn", "category", "keyword", "origin",
+            "url", "link_amazon", "link_idealo", "link_google_shopping", "link_aliexpress",
+        ]
+        try:
+            with path.open("w", encoding="utf-8", newline="") as handle:
+                writer = csv.DictWriter(handle, fieldnames=fields)
+                writer.writeheader()
+                for rank, item in enumerate(items, start=1):
+                    row = item.model_dump(include=set(fields))
+                    row.update(
+                        rank=rank,
+                        link_amazon=item.research_links.get("Amazon", ""),
+                        link_idealo=item.research_links.get("idealo", ""),
+                        link_google_shopping=item.research_links.get("Google Shopping", ""),
+                        link_aliexpress=item.research_links.get("AliExpress", ""),
+                    )
+                    writer.writerow(row)
+            written.append(path)
+        except OSError as exc:
+            logger.error("CSV-Export fehlgeschlagen: %s", exc)
+
+    if cfg.write_json:
+        path = out_dir / f"discovery-{stamp}.json"
+        try:
+            payload = {
+                "run_id": RUN_ID,
+                "generated_at": datetime.now(timezone.utc).isoformat(),
+                "count": len(items),
+                "items": [json.loads(i.model_dump_json()) for i in items],
+                "amazon_deals": [json.loads(d.model_dump_json()) for d in deals],
+            }
+            path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+            written.append(path)
+        except OSError as exc:
+            logger.error("JSON-Export fehlgeschlagen: %s", exc)
+
+    for path in written:
+        logger.info("Geschrieben: %s", path)
+    return written
+
+
+def print_discovery_report(items: list[HotItem], stats: dict[str, int]) -> None:
+    """Fundliste auf stdout."""
+    print()
+    print("=" * 78)
+    print(f"  PRODUKTFINDUNG | Lauf {RUN_ID} | {len(items)} gut laufende Artikel")
+    print("=" * 78)
+    print(
+        f"  {stats.get('keywords', 0)} Suchbegriffe, {stats.get('detail_lookups', 0)} Angebote "
+        f"im Detail, {stats.get('api_calls', 0)} eBay-Aufrufe | aussortiert: "
+        f"{stats.get('dropped_low_sales', 0)} zu wenig Verkaeufe, "
+        f"{stats.get('dropped_unprofitable', 0)} Preis traegt die Kosten nicht"
+    )
+    if not items:
+        print("\n  Keine Artikel, die die Kriterien erfuellen.\n")
+        return
+
+    for idx, item in enumerate(items, start=1):
+        tag = "  [eBay-Bestseller-Liste]" if item.origin == "bestseller" else ""
+        print(f"\n  [{idx}] {item.title[:66]}{tag}")
+        shipping = f" + {item.shipping_eur:.2f} Versand" if item.shipping_eur else ""
+        print(f"      Verkauf      {item.price_eur:>8.2f} EUR{shipping}")
+        if item.sold_per_day is not None and item.days_listed is not None:
+            print(
+                f"      Verkauft     {item.sold_quantity} Stk. in {item.days_listed:.0f} Tagen "
+                f"(~{item.sold_per_day:.1f}/Tag, Schaetzwert)"
+            )
+        else:
+            print(f"      Verkauft     {item.sold_quantity} Stk. (Angebotsalter unbekannt)")
+        if item.competing_listings > 1 and item.lowest_competitor_price_eur is not None:
+            print(
+                f"      Konkurrenz   {item.competing_listings} Angebote, "
+                f"guenstigstes {item.lowest_competitor_price_eur:.2f} EUR"
+            )
+        print(f"      Max. Einkauf {item.max_purchase_price_eur:>8.2f} EUR  (inkl. Versand zu dir, Gebinde 1:1)")
+        if item.max_purchase_at_lowest_price_eur is not None:
+            if item.max_purchase_at_lowest_price_eur > 0:
+                print(
+                    f"                   {item.max_purchase_at_lowest_price_eur:>8.2f} EUR  "
+                    "wenn du mit dem guenstigsten Anbieter gleichziehst"
+                )
+            else:
+                print("                   zum Preis des guenstigsten Anbieters nicht rentabel")
+        ident = "  ".join(
+            f"{label} {value}" for label, value in
+            (("EAN", item.gtin), ("Marke", item.brand), ("MPN", item.mpn)) if value
+        )
+        if ident:
+            print(f"      {ident}")
+        if item.url:
+            print(f"      eBay         {item.url}")
+        for label, link in item.research_links.items():
+            print(f"      {label + ':':<16} {link}")
+    print()
+    print("  Die Stueckzahl ist eBays Schaetzung fuer dieses eine Angebot seit seiner")
+    print("  Erstellung -- ein Tempo-Hinweis, kein Marktvolumen. Preise sind Angebots-,")
+    print("  keine erzielten Verkaufspreise.")
+    print()
+
+
+def _check_amazon(settings: Settings, args: argparse.Namespace, items: list[HotItem]) -> list[ScoutResult]:
+    """Nur mit Creators-API-Zugang: zu jedem Fund Amazon-Angebote suchen und
+    durch die normale Pruefung (Vorfilter, Matcher, Kalkulation) schicken."""
+    try:
+        amazon = build_amazon_client(settings)
+        scout = Scout(
+            settings,
+            dry_run=args.dry_run,
+            offline=args.offline,
+            use_prefilter=not args.no_prefilter,
+            provider_name=args.provider,
+        )
+    except (SourceError, MatcherError) as exc:
+        logger.warning("Amazon-Gegenpruefung uebersprungen: %s", exc)
+        return []
+
+    limit = settings.config.discovery.amazon_candidates_per_item
+    deals: list[ScoutResult] = []
+    for item in items:
+        if _shutdown_requested:
+            break
+        try:
+            pairs = amazon_pairs(item, amazon, limit)
+        except AmazonError as exc:
+            if exc.fatal:
+                logger.error("Amazon-Gegenpruefung abgebrochen: %s", exc)
+                break
+            logger.warning("Amazon-Suche zu '%s' uebersprungen: %s", item.title[:50], exc)
+            continue
+        for pair in pairs:
+            try:
+                result = scout._process(pair)
+            except Exception as exc:
+                logger.error("Paar %s uebersprungen: %s", pair.pair_id, exc)
+                continue
+            if result is not None:
+                deals.append(result)
+    scout.matcher.log_stats()
+    deals.sort(key=lambda r: r.net_profit_eur, reverse=True)
+    return deals
+
+
+def _execute_discovery(settings: Settings, args: argparse.Namespace) -> int:
+    cfg = settings.config
+    categories = cfg.search.categories
+    if args.category:
+        category = cfg.search.category(args.category)
+        if category is None:
+            known = ", ".join(c.name for c in cfg.search.categories) or "keine"
+            logger.error("Kategorie '%s' ist nicht konfiguriert. Bekannt: %s", args.category, known)
+            return EXIT_CONFIG
+        categories = [category]
+    if not categories:
+        logger.error(
+            "Produktfindung braucht Suchbegriffe: search.categories in config.yaml ist leer."
+        )
+        return EXIT_CONFIG
+    if args.limit:
+        cfg.discovery.max_results = min(args.limit, 200)
+
+    try:
+        ebay = build_ebay_client(settings)
+    except SourceError as exc:
+        logger.error("Produktfindung braucht eBay-Zugangsdaten: %s", exc)
+        return EXIT_CONFIG
+
+    discoverer = Discoverer(ebay, cfg.discovery, MarginCalculator.from_settings(settings))
+    logger.info(
+        "Produktfindung %s gestartet | Kategorien: %s | Budget: %d eBay-Aufrufe",
+        RUN_ID, ", ".join(c.name for c in categories) or "keine", cfg.discovery.max_api_calls,
+    )
+    try:
+        items = discoverer.run(categories)
+    except DiscoveryError as exc:
+        logger.error("Produktfindung abgebrochen: %s", exc)
+        return EXIT_ERROR
+
+    stats = discoverer.stats
+    logger.info(
+        "Produktfindung beendet | Funde: %d | Details: %d | eBay-Aufrufe: %d | "
+        "zu wenig Verkaeufe: %d | unrentabel: %d",
+        len(items), stats["detail_lookups"], stats["api_calls"],
+        stats["dropped_low_sales"], stats["dropped_unprofitable"],
+    )
+
+    deals: list[ScoutResult] = []
+    if items and settings.secrets.has_amazon:
+        deals = _check_amazon(settings, args, items)
+
+    if not args.no_export and not args.dry_run:
+        export_discovery(settings, items, deals)
+
+    if args.notify_telegram:
+        sent = send_discovery_summary(settings, items, deals, stats, run_id=RUN_ID)
+        logger.info("Telegram-Benachrichtigung %s.", "gesendet" if sent else "nicht gesendet")
+
+    if not args.quiet:
+        print_discovery_report(items, stats)
+        if deals:
+            print("  Gegenpruefung auf Amazon:")
+            print_report(deals, verbose=args.verbose)
+        elif items and not settings.secrets.has_amazon:
+            print("  Einkaufsquellen: ohne Amazon-Creators-Zugang erfolgt keine automatische")
+            print("  Gegenpruefung. Angebot ueber die Links suchen, in data/purchases.csv")
+            print("  eintragen -- der normale Lauf (sources.provider: api) prueft es dann.")
+            print()
+
+    return EXIT_INTERRUPTED if _shutdown_requested else EXIT_OK
+
+
+# ---------------------------------------------------------------------------
 # Lockfile -- verhindert ueberlappende Cron-Laeufe
 # ---------------------------------------------------------------------------
 class RunLock:
@@ -575,6 +814,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Konfiguration laden, pruefen, ausgeben und beenden.",
     )
     parser.add_argument(
+        "--discover",
+        action="store_true",
+        help="Produktfindung: gut laufende eBay-Artikel suchen und den hoechsten "
+             "noch lohnenden Einkaufspreis ausgeben (braucht EBAY_APP_ID/EBAY_CERT_ID).",
+    )
+    parser.add_argument(
         "--write-example-data",
         action="store_true",
         help="Beispiel-CSV nach data/offers.example.csv schreiben und beenden.",
@@ -652,10 +897,11 @@ def main(argv: list[str] | None = None) -> int:
 
     lock_path = settings.resolve("logs/scout.lock")
     try:
+        runner = _execute_discovery if args.discover else _execute
         if args.no_lock:
-            return _execute(settings, args)
+            return runner(settings, args)
         with RunLock(lock_path):
-            return _execute(settings, args)
+            return runner(settings, args)
     except RuntimeError as exc:  # Lock belegt
         logger.error("%s", exc)
         return EXIT_ERROR

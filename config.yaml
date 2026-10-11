@@ -144,6 +144,22 @@ logging:
   console: true
   json_format: false               # true = strukturierte Logs fuer Loki/ELK
 
+# --- Produktfindung (scout.py --discover) -----------------------------------
+# Sucht zu den Suchbegriffen oben gut laufende Angebote auf eBay.de und rechnet
+# aus, was der Einkauf hoechstens kosten darf. Braucht EBAY_APP_ID/EBAY_CERT_ID.
+discovery:
+  results_per_keyword: 30          # Suchtreffer je Begriff (eBays Relevanz-Reihenfolge)
+  detail_lookups_per_keyword: 15   # davon mit Verkaufsmenge pruefen (je 1 eBay-Aufruf)
+  min_sold_quantity: 10            # weniger verkaufte Stueck = kein "gut laufend"
+  min_sold_per_day: 0.0            # optional: Mindesttempo
+  max_results: 20                  # Laenge der Fundliste
+  max_api_calls: 300               # harte Obergrenze je Lauf (eBay-Kontingent: 5.000/Tag)
+  # eBays Bestseller-Liste der Kategorie zusaetzlich auswerten. Braucht die
+  # Berechtigung buy.marketing; fehlt sie, schaltet sich das von selbst ab.
+  use_bestseller_lists: true
+  bestsellers_per_category: 10
+  amazon_candidates_per_item: 3    # nur mit Amazon-Creators-Zugang relevant
+
 # --- Telegram (optional) -----------------------------------------------------
 # Zugangsdaten (TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID) stehen in .env, nicht hier.
 telegram:

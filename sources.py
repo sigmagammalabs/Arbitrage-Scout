@@ -577,26 +577,36 @@ def build_source(settings: Settings) -> OfferSource:
     raise SourceError(f"Unbekannter Provider: {provider}")
 
 
-def _build_api_source(settings: Settings) -> ApiOfferSource:
-    api_cfg = settings.config.sources.api
-    http_cfg = settings.config.sources.http
+def build_ebay_client(settings: Settings) -> EbayClient:
+    """eBay-Client aus den Settings. ``SourceError`` bei fehlenden Keys."""
     try:
         client_id, client_secret = settings.secrets.require_ebay()
     except ConfigError as exc:
         raise SourceError(str(exc)) from exc
-    ebay = EbayClient(client_id, client_secret, api_cfg, http_cfg)
+    return EbayClient(
+        client_id, client_secret, settings.config.sources.api, settings.config.sources.http
+    )
+
+
+def build_amazon_client(settings: Settings) -> AmazonClient:
+    """Amazon-Client aus den Settings. ``SourceError`` bei fehlenden Keys/Paket."""
+    try:
+        cred_id, cred_secret, cred_version, partner_tag = settings.secrets.require_amazon()
+        return AmazonClient(
+            cred_id, cred_secret, cred_version, partner_tag, settings.config.sources.api,
+            timeout_seconds=settings.config.sources.http.timeout_seconds,
+        )
+    except (ConfigError, AmazonError) as exc:
+        raise SourceError(str(exc)) from exc
+
+
+def _build_api_source(settings: Settings) -> ApiOfferSource:
+    api_cfg = settings.config.sources.api
+    ebay = build_ebay_client(settings)
 
     purchases: PurchaseProvider
     if api_cfg.purchase_source == "amazon":
-        try:
-            cred_id, cred_secret, cred_version, partner_tag = settings.secrets.require_amazon()
-            client = AmazonClient(
-                cred_id, cred_secret, cred_version, partner_tag, api_cfg,
-                timeout_seconds=http_cfg.timeout_seconds,
-            )
-        except (ConfigError, AmazonError) as exc:
-            raise SourceError(str(exc)) from exc
-        purchases = AmazonPurchaseProvider(client)
+        purchases = AmazonPurchaseProvider(build_amazon_client(settings))
         logger.info("Datenquelle: Amazon Creators API (%s) -> eBay %s",
                     api_cfg.amazon_country, api_cfg.ebay_marketplace)
     else:
